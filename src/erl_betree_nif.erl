@@ -10,6 +10,7 @@
     betree_insert_sub/2,
     betree_exists/2,
     betree_search/2,
+    betree_search_/2,
     betree_search/3,
     betree_search_evt/3,
     betree_search_evt/4,
@@ -75,6 +76,8 @@ betree_insert_sub(_Betree, _Sub) ->
 betree_exists(_Betree, _Event) ->
     ?nif_stub.
 betree_search(_Betree, _Event) ->
+    ?nif_stub.
+betree_search_(_Betree, _Event) ->
     ?nif_stub.
 betree_search(_Betree, _Event, _ClockType) ->
     ?nif_stub.

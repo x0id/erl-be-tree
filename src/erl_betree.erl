@@ -13,6 +13,7 @@
     betree_search_ids/3,
     betree_search_ids/4,
     betree_write_dot/2,
+    betree_search_/2,
 
     % search with iterator
     search_iterator/2,
@@ -67,6 +68,8 @@ betree_exists(Betree, Event) ->
     erl_betree_nif:betree_exists(Betree, Event).
 betree_search(Betree, Event) ->
     erl_betree_nif:betree_search(Betree, Event).
+betree_search_(Betree, Event) ->
+    erl_betree_nif:betree_search_(Betree, Event).
 
 % @doc Calculates time spend in NIF. 
 % Time value is in microseconds - the erlang:timestamp resolution.  

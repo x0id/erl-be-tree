@@ -1155,6 +1155,10 @@ cleanup:
   return retval;
 }
 
+static void hook(void *arg, betree_sub_t id, bool result, const void *context) {
+  fprintf(stderr, "%lu: %s in %s\r\n", id, result ? "ok" : "err", (const char *)context);
+}
+
 static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
@@ -1206,6 +1210,9 @@ static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
   }
 
   report = make_report();
+  report->cb = hook;
+  report->arg = NULL;
+  fprintf(stderr, "gonna search\r\n");
   bool result = betree_search_with_event(betree, event, report);
 
   if (result == false) {
@@ -1216,6 +1223,107 @@ static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
   ERL_NIF_TERM res = ids_from_report(env, report);
 
   retval = enif_make_tuple2(env, atom_ok, res);
+cleanup:
+  if (event != NULL) {
+    betree_free_event(event);
+  }
+  if (report != NULL) {
+    free_report(report);
+  }
+  return retval;
+}
+
+struct ids_with_reasons {
+  ErlNifEnv *env;
+  ERL_NIF_TERM ids;
+  ERL_NIF_TERM map;
+};
+
+static void acc_ret(void *arg, betree_sub_t id, bool success, const void *context) {
+    struct ids_with_reasons *this = (struct ids_with_reasons *)arg;
+    ErlNifEnv *env = this->env;
+    if (success) {
+        this->ids = enif_make_list_cell(env, enif_make_uint64(env, id), this->ids);
+    } else {
+        ERL_NIF_TERM key = enif_make_atom(env, context ? context : "nil");
+        ERL_NIF_TERM ids;
+        if (enif_get_map_value(env, this->map, key, &ids) && enif_is_list(env, ids)) {
+            ids = enif_make_list_cell(env, enif_make_uint64(env, id), ids);
+        } else {
+            ids = enif_make_list(env, 1, enif_make_uint64(env, id));
+        }
+        enif_make_map_put(env, this->map, key, ids, &this->map);
+    }
+}
+
+static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[]) {
+  ERL_NIF_TERM retval;
+  struct report *report = NULL;
+  size_t pred_index = 0;
+  struct betree_event *event = NULL;
+
+  if (argc != 2) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  struct betree *betree = get_betree(env, argv[0]);
+  if (betree == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  unsigned int list_len;
+  if (!enif_get_list_length(env, argv[1], &list_len)) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  event = betree_make_event(betree);
+
+  ERL_NIF_TERM head;
+  ERL_NIF_TERM tail = argv[1];
+
+  const ERL_NIF_TERM *tuple;
+  int tuple_len;
+
+  for (unsigned int i = 0; i < list_len; i++) {
+    if (!enif_get_list_cell(env, tail, &head, &tail)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+
+    if (!enif_get_tuple(env, head, &tuple_len, &tuple)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+    pred_index += (tuple_len - 1);
+  }
+
+  struct ids_with_reasons acc = {
+    .env = env,
+    .ids = enif_make_list(env, 0),
+    .map = enif_make_new_map(env)
+  };
+  report = make_report();
+  report->cb = &acc_ret;
+  report->arg = &acc;
+  fprintf(stderr, "gonna search\r\n");
+  bool result = betree_search_with_event(betree, event, report);
+
+  if (result == false) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  retval = enif_make_tuple3(env, atom_ok, acc.ids, acc.map);
+
 cleanup:
   if (event != NULL) {
     betree_free_event(event);
@@ -1977,7 +2085,7 @@ static ERL_NIF_TERM nif_betree_search_yield(ErlNifEnv *env, int argc,
   struct subs_to_eval subs;
   init_subs_to_eval_ext(&subs, 1024);
   match_be_tree((const struct attr_domain **)betree->config->attr_domains,
-                variables, betree->cnode, &subs);
+                variables, betree->cnode, &subs, NULL);
   if (subs.count == 0) {
     ERL_NIF_TERM tmp[1];
     ERL_NIF_TERM matched = enif_make_list_from_array(env, tmp, 0);
@@ -3070,6 +3178,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_insert_sub", 2, nif_betree_insert_sub, 0},
     {"betree_exists", 2, nif_betree_exists, 0},
     {"betree_search", 2, nif_betree_search, 0},
+    {"betree_search_", 2, nif_betree_search_, 0},
     {"betree_search", 3, nif_betree_search_t, 0},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
