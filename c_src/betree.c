@@ -2084,8 +2084,7 @@ static ERL_NIF_TERM nif_betree_search_yield(ErlNifEnv *env, int argc,
 
   struct subs_to_eval subs;
   init_subs_to_eval_ext(&subs, 1024);
-  match_be_tree((const struct attr_domain **)betree->config->attr_domains,
-                variables, betree->cnode, &subs, NULL);
+  match_be_tree(betree->config, variables, betree->cnode, &subs, NULL);
   if (subs.count == 0) {
     ERL_NIF_TERM tmp[1];
     ERL_NIF_TERM matched = enif_make_list_from_array(env, tmp, 0);
