@@ -2,7 +2,9 @@
 -include("erl_betree.hrl").
 
 -export([
+    betree_print/1,
     betree_make/1,
+    betree_make/2,
     betree_make_event/2,
     betree_make_event/3,
     betree_make_sub/4,
@@ -51,8 +53,12 @@
 ]).
 
 
+betree_print(Betree) ->
+    erl_betree_nif:betree_print(Betree).
 betree_make(Domains) ->
     erl_betree_nif:betree_make(Domains).
+betree_make(Domains, Ranks) ->
+    erl_betree_nif:betree_make(Domains, Ranks).
 betree_make_event(Betree, Event) ->
     betree_make_event(Betree, Event, ?CLOCK_MONOTONIC).
 

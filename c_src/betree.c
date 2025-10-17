@@ -702,8 +702,20 @@ static bool get_segments_list(ErlNifEnv *env, ERL_NIF_TERM term,
 
 #define DOMAIN_NAME_LEN 256
 
+static int get_rank(ErlNifEnv *env, ERL_NIF_TERM name, const ERL_NIF_TERM *ranks) {
+  if (ranks == NULL)
+    return 0;
+  ERL_NIF_TERM ret;
+  if (!enif_get_map_value(env, *ranks, name, &ret))
+    return 0;
+  int rank;
+  if (!enif_get_int(env, ret, &rank))
+    return 0;
+  return rank;
+}
+
 static bool add_domains(ErlNifEnv *env, struct betree *betree,
-                        ERL_NIF_TERM list, unsigned int list_len) {
+                        ERL_NIF_TERM list, unsigned int list_len, const ERL_NIF_TERM *ranks) {
   ERL_NIF_TERM head;
   ERL_NIF_TERM tail = list;
   const ERL_NIF_TERM *tuple;
@@ -745,8 +757,8 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
           return false;
         }
       }
-      betree_add_integer_variable(betree, domain_name, allow_undefined, min,
-                                  max);
+      betree_add_ranked_integer_variable(
+        betree, domain_name, allow_undefined, min, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_int_list, tuple[1])) {
       int64_t min = INT64_MIN;
       int64_t max = INT64_MAX;
@@ -757,8 +769,8 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
           return false;
         }
       }
-      betree_add_integer_list_variable(betree, domain_name, allow_undefined,
-                                       min, max);
+      betree_add_ranked_integer_list_variable(
+        betree, domain_name, allow_undefined, min, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_int_enum, tuple[1])) {
       size_t max = SIZE_MAX;
       if (tuple_len == 4) {
@@ -768,8 +780,8 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
         }
         max = (size_t)u64_max;
       }
-      betree_add_integer_enum_variable(betree, domain_name, allow_undefined,
-                                       max);
+      betree_add_ranked_integer_enum_variable(
+        betree, domain_name, allow_undefined, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_bin, tuple[1])) {
       size_t max = SIZE_MAX;
       if (tuple_len == 4) {
@@ -779,7 +791,8 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
         }
         max = (size_t)u64_max;
       }
-      betree_add_string_variable(betree, domain_name, allow_undefined, max);
+      betree_add_ranked_string_variable(
+        betree, domain_name, allow_undefined, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_bin_list, tuple[1])) {
       size_t max = SIZE_MAX;
       if (tuple_len == 4) {
@@ -789,10 +802,11 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
         }
         max = (size_t)u64_max;
       }
-      betree_add_string_list_variable(betree, domain_name, allow_undefined,
-                                      max);
+      betree_add_ranked_string_list_variable(
+        betree, domain_name, allow_undefined, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_bool, tuple[1])) {
-      betree_add_boolean_variable(betree, domain_name, allow_undefined);
+      betree_add_ranked_boolean_variable(
+        betree, domain_name, allow_undefined, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_float, tuple[1])) {
       double min = -DBL_MAX;
       double max = DBL_MAX;
@@ -802,11 +816,14 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
           return false;
         }
       }
-      betree_add_float_variable(betree, domain_name, allow_undefined, min, max);
+      betree_add_ranked_float_variable(
+        betree, domain_name, allow_undefined, min, max, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_frequency_caps, tuple[1])) {
-      betree_add_frequency_caps_variable(betree, domain_name, allow_undefined);
+      betree_add_ranked_frequency_caps_variable(
+        betree, domain_name, allow_undefined, get_rank(env, tuple[0], ranks));
     } else if (enif_is_identical(atom_segments, tuple[1])) {
-      betree_add_segments_variable(betree, domain_name, allow_undefined);
+      betree_add_ranked_segments_variable(
+        betree, domain_name, allow_undefined, get_rank(env, tuple[0], ranks));
     } else {
       return false;
     }
@@ -874,7 +891,7 @@ static bool add_variables(ErlNifEnv *env, struct betree *betree,
 static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
                                     const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
-  if (argc != 1) {
+  if (argc < 1 || argc > 2) {
     retval = enif_make_badarg(env);
     goto cleanup;
   }
@@ -892,6 +909,15 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
+  const ERL_NIF_TERM *ranks = NULL;
+  if (argc == 2) {
+    if (!enif_is_map(env, argv[1])) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+    ranks = &argv[1];
+  }
+
   ERL_NIF_TERM head;
   ERL_NIF_TERM tail = argv[0];
 
@@ -906,7 +932,7 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
       goto cleanup;
     }
 
-    if (!add_domains(env, betree, head, inner_list_len)) {
+    if (!add_domains(env, betree, head, inner_list_len, ranks)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1155,10 +1181,6 @@ cleanup:
   return retval;
 }
 
-static void hook(void *arg, betree_sub_t id, bool result, const void *context) {
-  fprintf(stderr, "%lu: %s in %s\r\n", id, result ? "ok" : "err", (const char *)context);
-}
-
 static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
@@ -1210,9 +1232,6 @@ static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
   }
 
   report = make_report();
-  report->cb = hook;
-  report->arg = NULL;
-  fprintf(stderr, "gonna search\r\n");
   bool result = betree_search_with_event(betree, event, report);
 
   if (result == false) {
@@ -1314,7 +1333,6 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
   report = make_report();
   report->cb = &acc_ret;
   report->arg = &acc;
-  fprintf(stderr, "gonna search\r\n");
   bool result = betree_search_with_event(betree, event, report);
 
   if (result == false) {
@@ -3170,8 +3188,33 @@ static ERL_NIF_TERM betree_write_dot_err(ErlNifEnv *env, int argc,
  * betree search error reason code end
  */
 
+void print_betree(const struct betree* betree);
+
+static ERL_NIF_TERM nif_betree_print(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[]) {
+  ERL_NIF_TERM retval = atom_ok;
+
+  if (argc != 1) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  struct betree *betree = get_betree(env, argv[0]);
+  if (betree == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  print_betree(betree);
+
+cleanup:
+  return retval;
+}
+
 static ErlNifFunc nif_functions[] = {
+    {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
     {"betree_make", 1, nif_betree_make, 0},
+    {"betree_make", 2, nif_betree_make, 0},
     {"betree_make_event", 3, nif_betree_make_event, 0},
     {"betree_make_sub", 4, nif_betree_make_sub, 0},
     {"betree_insert_sub", 2, nif_betree_insert_sub, 0},

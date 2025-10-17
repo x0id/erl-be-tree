@@ -4,7 +4,9 @@
 -on_load(on_load/0).
 
 -export([
+    betree_print/1,
     betree_make/1,
+    betree_make/2,
     betree_make_event/3,
     betree_make_sub/4,
     betree_insert_sub/2,
@@ -65,7 +67,11 @@ on_load() ->
 nif_stub_error(Line) ->
     erlang:nif_error({nif_not_loaded,module,?MODULE,line,Line}).
 
+betree_print(_Betree) ->
+    ?nif_stub.
 betree_make(_Domains) ->
+    ?nif_stub.
+betree_make(_Domains, _Ranks) ->
     ?nif_stub.
 betree_make_event(_Betree, _Event, _ClockType) ->
     ?nif_stub.
