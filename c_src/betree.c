@@ -1150,6 +1150,55 @@ cleanup:
   return retval;
 }
 
+struct sub_info {
+  betree_sub_t sub_id;
+};
+
+struct sub_result {
+  betree_sub_t sub_id;
+  ERL_NIF_TERM context;
+  bool matched;
+};
+
+static struct sub_info* sub_index;
+static size_t sub_capacity;
+static size_t sub_count;
+
+static bool index_sub(betree_sub_t sub_id, void** ptr) {
+  // Check if we need to allocate or grow the array
+  if (sub_count >= sub_capacity) {
+    size_t new_capacity = (sub_capacity == 0) ? 16 : sub_capacity * 2;
+    struct sub_info* new_index;
+
+    if (sub_index == NULL) {
+      // Initial allocation
+      new_index = (struct sub_info*)enif_alloc(new_capacity * sizeof(struct sub_info));
+    } else {
+      // Reallocation
+      new_index = (struct sub_info*)enif_realloc(sub_index, new_capacity * sizeof(struct sub_info));
+    }
+
+    if (new_index == NULL) {
+      // Memory allocation failed
+      return false;
+    }
+
+    sub_index = new_index;
+    sub_capacity = new_capacity;
+  }
+
+  // Add new element at the end of the array
+  sub_index[sub_count].sub_id = sub_id;
+
+  // Return pointer to the newly added element
+  *ptr = &sub_index[sub_count];
+
+  // Increment count
+  sub_count++;
+
+  return true;
+}
+
 static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
                                         const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
@@ -1232,14 +1281,18 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  const struct betree_sub *betree_sub =
+  struct betree_sub *betree_sub =
       betree_make_sub(betree, sub_id, constant_count,
                       (const struct betree_constant **)constants, expr);
   if (betree_sub == NULL) {
     retval = enif_make_tuple2(env, atom_error, atom_failed);
     goto cleanup;
   }
-  // betree_sub->data = ...
+
+  if (!index_sub(sub_id, &betree_sub->data)) {
+    retval = enif_make_tuple2(env, atom_error, atom_failed);
+    goto cleanup;
+  }
 
   bool result = betree_insert_sub(betree, betree_sub);
   if (result) {
