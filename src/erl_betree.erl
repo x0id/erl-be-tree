@@ -9,6 +9,7 @@
     betree_make_event/3,
     betree_make_sub/4,
     betree_insert_sub/2,
+    betree_add_sub/4,
     betree_exists/2,
     betree_search/2,
     betree_search/3,
@@ -70,6 +71,8 @@ betree_make_sub(Betree, SubId, Constants, Expr) ->
     erl_betree_nif:betree_make_sub(Betree, SubId, Constants, Expr).
 betree_insert_sub(Betree, Sub) ->
     erl_betree_nif:betree_insert_sub(Betree, Sub).
+betree_add_sub(Betree, SubId, Constants, Expr) ->
+    erl_betree_nif:betree_add_sub(Betree, SubId, Constants, Expr).
 betree_exists(Betree, Event) ->
     erl_betree_nif:betree_exists(Betree, Event).
 betree_search(Betree, Event) ->

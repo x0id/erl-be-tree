@@ -10,6 +10,7 @@
     betree_make_event/3,
     betree_make_sub/4,
     betree_insert_sub/2,
+    betree_add_sub/4,
     betree_exists/2,
     betree_search/2,
     betree_search_/2,
@@ -78,6 +79,8 @@ betree_make_event(_Betree, _Event, _ClockType) ->
 betree_make_sub(_Betree, _SubId, _Constants, _Expr) ->
     ?nif_stub.
 betree_insert_sub(_Betree, _Sub) ->
+    ?nif_stub.
+betree_add_sub(_Betree, _SubId, _Constants, _Expr) ->
     ?nif_stub.
 betree_exists(_Betree, _Event) ->
     ?nif_stub.
