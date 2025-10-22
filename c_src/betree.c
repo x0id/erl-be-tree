@@ -86,6 +86,7 @@ static ERL_NIF_TERM make_time(ErlNifEnv *env, const struct timespec *start,
 #include "alloc.h"
 #include "hashmap.h"
 #include "tree.h"
+#include <assert.h>
 
 // search_iterator
 struct search_iterator {
@@ -1151,23 +1152,18 @@ cleanup:
 }
 
 struct sub_info {
-  betree_sub_t sub_id;
-};
-
-struct sub_result {
-  betree_sub_t sub_id;
-  ERL_NIF_TERM context;
-  bool matched;
+  ERL_NIF_TERM sub_id;
+  size_t index;
 };
 
 static struct sub_info* sub_index;
 static size_t sub_capacity;
 static size_t sub_count;
 
-static bool index_sub(betree_sub_t sub_id, void** ptr) {
+static bool index_sub(ErlNifEnv* env, betree_sub_t sub_id, void** ptr) {
   // Check if we need to allocate or grow the array
   if (sub_count >= sub_capacity) {
-    size_t new_capacity = (sub_capacity == 0) ? 16 : sub_capacity * 2;
+    size_t new_capacity = (sub_capacity == 0) ? 64 : sub_capacity * 2;
     struct sub_info* new_index;
 
     if (sub_index == NULL) {
@@ -1188,7 +1184,8 @@ static bool index_sub(betree_sub_t sub_id, void** ptr) {
   }
 
   // Add new element at the end of the array
-  sub_index[sub_count].sub_id = sub_id;
+  sub_index[sub_count].sub_id = enif_make_uint64(env, sub_id);
+  sub_index[sub_count].index = sub_count;
 
   // Return pointer to the newly added element
   *ptr = &sub_index[sub_count];
@@ -1289,7 +1286,7 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  if (!index_sub(sub_id, &betree_sub->data)) {
+  if (!index_sub(env, sub_id, &betree_sub->data)) {
     retval = enif_make_tuple2(env, atom_error, atom_failed);
     goto cleanup;
   }
@@ -1416,13 +1413,34 @@ cleanup:
 }
 
 struct ids_with_reasons {
-  ErlNifEnv *env;
-  ERL_NIF_TERM ids;
-  ERL_NIF_TERM map;
+  ErlNifEnv* env;
+  // ERL_NIF_TERM ids;
+  // ERL_NIF_TERM map;
+
+  // subscribers
+  ERL_NIF_TERM* subs;
+
+  // results
+  ERL_NIF_TERM* rets;
 };
 
 static void acc_ret(void *arg, void *data, bool success, const void *context) {
-    struct ids_with_reasons *this = (struct ids_with_reasons *)arg;
+  assert(arg != NULL);
+  assert(data != NULL);
+  struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
+  struct sub_info* info = (struct sub_info*) data;
+  ErlNifEnv *env = this->env;
+  assert(this->env != NULL);
+  assert(this->subs != NULL);
+  assert(this->rets != NULL);
+  if (info->index >= sub_capacity) {
+    fprintf(stderr, "%lu >= %lu\r\n", info->index, sub_capacity);
+    abort();
+  }
+  assert(info->index < sub_count);
+  this->subs[info->index] = info->sub_id;
+  this->rets[info->index] = success ? atom_ok : enif_make_atom(env, context ? context : "nil");
+/*
     ErlNifEnv *env = this->env;
     betree_sub_t id = (betree_sub_t)data;
     if (success) {
@@ -1437,6 +1455,7 @@ static void acc_ret(void *arg, void *data, bool success, const void *context) {
         }
         enif_make_map_put(env, this->map, key, ids, &this->map);
     }
+*/
 }
 
 static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
@@ -1491,8 +1510,10 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
 
   struct ids_with_reasons acc = {
     .env = env,
-    .ids = enif_make_list(env, 0),
-    .map = enif_make_new_map(env)
+    // .ids = enif_make_list(env, 0),
+    // .map = enif_make_new_map(env)
+    .subs = enif_alloc(sub_count * sizeof(ERL_NIF_TERM)),
+    .rets = enif_alloc(sub_count * sizeof(ERL_NIF_TERM))
   };
   report = make_report();
   report->cb = &acc_ret;
@@ -1504,7 +1525,7 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  retval = enif_make_tuple3(env, atom_ok, acc.ids, acc.map);
+  retval = enif_make_tuple2(env, atom_ok, enif_make_list_from_array(env, acc.rets, sub_count));
 
 cleanup:
   if (event != NULL) {
