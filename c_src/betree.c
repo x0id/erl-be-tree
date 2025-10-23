@@ -829,6 +829,13 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
       return false;
     }
   }
+
+  // set attr_var.data to the atom representation of the attr
+  for (size_t i=0; i<betree->config->attr_domain_count; i++) {
+    struct attr_domain* ad = betree->config->attr_domains[i];
+    ad->attr_var.data = (void*)enif_make_atom(env, ad->attr_var.attr);
+  }
+
   return true;
 }
 
@@ -1411,7 +1418,7 @@ cleanup:
 }
 
 struct ids_with_reasons {
-  ErlNifEnv* env;
+  // ErlNifEnv* env;
   // ERL_NIF_TERM ids;
   // ERL_NIF_TERM map;
 
@@ -1428,11 +1435,11 @@ static void acc_ret(void *arg, void *data, bool success, const void *context) {
   assert(index < sub_count);
   struct sub_info* info = &sub_index[index];
   struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
-  ErlNifEnv *env = this->env;
+  // ErlNifEnv *env = this->env;
   assert(this->subs != NULL);
   assert(this->rets != NULL);
   this->subs[index] = info->sub_id;
-  this->rets[index] = success ? atom_ok : enif_make_atom(env, context ? context : "nil");
+  this->rets[index] = success ? atom_ok : context ? (ERL_NIF_TERM)context : atom_error;
 /*
     ErlNifEnv *env = this->env;
     betree_sub_t id = (betree_sub_t)data;
@@ -1502,7 +1509,7 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
   }
 
   struct ids_with_reasons acc = {
-    .env = env,
+    // .env = env,
     // .ids = enif_make_list(env, 0),
     // .map = enif_make_new_map(env)
     .subs = enif_alloc(sub_count * sizeof(ERL_NIF_TERM)),
