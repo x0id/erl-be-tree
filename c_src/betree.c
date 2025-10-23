@@ -1153,7 +1153,6 @@ cleanup:
 
 struct sub_info {
   ERL_NIF_TERM sub_id;
-  size_t index;
 };
 
 static struct sub_info* sub_index;
@@ -1185,10 +1184,9 @@ static bool index_sub(ErlNifEnv* env, betree_sub_t sub_id, void** ptr) {
 
   // Add new element at the end of the array
   sub_index[sub_count].sub_id = enif_make_uint64(env, sub_id);
-  sub_index[sub_count].index = sub_count;
 
-  // Return pointer to the newly added element
-  *ptr = &sub_index[sub_count];
+  // Return index of the newly added element
+  *ptr = (void*)sub_count;
 
   // Increment count
   sub_count++;
@@ -1425,21 +1423,16 @@ struct ids_with_reasons {
 };
 
 static void acc_ret(void *arg, void *data, bool success, const void *context) {
-  assert(arg != NULL);
-  assert(data != NULL);
+  size_t index = (size_t)data;
+  assert(index < sub_capacity);
+  assert(index < sub_count);
+  struct sub_info* info = &sub_index[index];
   struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
-  struct sub_info* info = (struct sub_info*) data;
   ErlNifEnv *env = this->env;
-  assert(this->env != NULL);
   assert(this->subs != NULL);
   assert(this->rets != NULL);
-  if (info->index >= sub_capacity) {
-    fprintf(stderr, "%lu >= %lu\r\n", info->index, sub_capacity);
-    abort();
-  }
-  assert(info->index < sub_count);
-  this->subs[info->index] = info->sub_id;
-  this->rets[info->index] = success ? atom_ok : enif_make_atom(env, context ? context : "nil");
+  this->subs[index] = info->sub_id;
+  this->rets[index] = success ? atom_ok : enif_make_atom(env, context ? context : "nil");
 /*
     ErlNifEnv *env = this->env;
     betree_sub_t id = (betree_sub_t)data;
