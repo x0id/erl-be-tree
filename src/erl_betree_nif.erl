@@ -34,6 +34,7 @@
 
     % search error reason
     betree_make_sub_ids/1,
+    betree_prepare_subs/1,
     betree_make_err/1,
     betree_make_event_err/3,
     betree_make_sub_err/4,
@@ -119,6 +120,9 @@ search_ids_yield(_Betree, _Event, _Ids, _ClockType, _YieldThresholdInMicrosecond
 
 %% betree search error reason begin
 betree_make_sub_ids(_Betree) ->
+    ?nif_stub.
+
+betree_prepare_subs(_Betree) ->
     ?nif_stub.
 
 betree_make_err(_Domains) ->

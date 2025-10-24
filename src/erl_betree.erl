@@ -39,7 +39,8 @@
     search_ids_yield/5,
 
     % search error reason
-    betree_make_sub_ids/1, 
+    betree_make_sub_ids/1,
+    betree_prepare_subs/1,
     betree_make_err/1,
     betree_make_event_err/2,
     betree_make_event_err/3,
@@ -200,8 +201,11 @@ search_ids_yield(Betree, Event, Ids = [_|_], ClockType, YieldThresholdInMicrosec
 %%
 %% betree search error reason begin
 %%
-betree_make_sub_ids(Betree) -> 
+betree_make_sub_ids(Betree) ->
     erl_betree_nif:betree_make_sub_ids(Betree).
+
+betree_prepare_subs(Betree) ->
+    erl_betree_nif:betree_prepare_subs(Betree).
 
 betree_make_err(Domains) ->
     erl_betree_nif:betree_make_err(Domains).
