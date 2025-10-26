@@ -1167,11 +1167,22 @@ static struct sub_info* sub_index;
 static size_t sub_capacity;
 static size_t sub_count;
 
+static void (*aggregate)(void** list, size_t count, void** result) {
+  betree_sub_t* arr = (betree_sub_t*)enif_alloc(count * sizeof(betree_sub_t));
+  betree_sub_t* ptr = arr;
+
+  for (size_t i=0; i<count; i++) {
+    size_t index = (size_t)list[i];
+    *ptr++ = sub_index[index].sub_id;
+  }
+}
+
 static void prepare_subs_data(struct betree* betree) {
   betree->subs_data = (struct subs_data*)enif_alloc(sizeof(struct subs_data));
   betree->subs_data->array = (void**)enif_alloc(sub_count * sizeof(void*));
   betree->subs_data->limit = sub_count;
   betree->subs_data->count = 0;
+  betree->subs_data->aggregate = &acc_agg;
   betree_prepare_sub_data(betree);
 }
 
@@ -1433,23 +1444,24 @@ struct ids_with_reasons {
   ERL_NIF_TERM* rets;
 };
 
-static void acc_ret(void *arg, void *data, bool success, const void *context) {
+static void var_ret(void *arg, void *data, bool success, const void *context) {
   size_t index = (size_t)data;
   struct sub_info* info = &sub_index[index];
-  struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
+  struct ids_with_reasons *this = (struct ids_with_reasons*)arg;
   this->subs[index] = info->sub_id;
   this->rets[index] = success ? atom_ok : context ? (ERL_NIF_TERM)context : atom_error;
 }
 
-static void acc_arr(void* arg, void** data, size_t count, const void* context) {
-  struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
+static void agg_ret(void* arg, void* data, const void* context) {
+  struct ids_with_reasons *this = (struct ids_with_reasons*)arg;
   ERL_NIF_TERM ret = context ? (ERL_NIF_TERM)context : atom_error;
-  for (size_t i=0; i<count; i++) {
+  /* for (size_t i=0; i<count; i++) {
     size_t index = (size_t)data[i];
     struct sub_info* info = &sub_index[index];
     this->subs[index] = info->sub_id;
     this->rets[index] = ret;
-  }
+  } */
+  this->list[k++] = (ERL_NIF_TERM)data;
 }
 
 static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
@@ -1513,8 +1525,8 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
     .rets = rets  // enif_alloc(sub_count * sizeof(ERL_NIF_TERM))
   };
   report = make_report();
-  report->cb = &acc_ret;
-  report->cba = &acc_arr;
+  report->cb = &var_ret;
+  report->cba = &agg_ret;
   report->arg = &acc;
   bool result = betree_search_with_event(betree, event, report);
 
