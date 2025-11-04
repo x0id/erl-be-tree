@@ -33,6 +33,7 @@ static ERL_NIF_TERM atom_bad_constant_list;
 static ERL_NIF_TERM atom_bad_constant;
 static ERL_NIF_TERM atom_bad_binary;
 static ERL_NIF_TERM atom_failed;
+static ERL_NIF_TERM atom_mem_alloc_failed;
 
 // domain types
 static ERL_NIF_TERM atom_int;
@@ -71,6 +72,22 @@ struct sub {
 struct evt {
   struct betree_event *event;
 };
+
+struct sub_info {
+  ERL_NIF_TERM sub_id;
+};
+
+struct betree_resource {
+  struct betree* betree;
+  struct sub_info* sub_index;
+  size_t sub_capacity;
+  size_t sub_count;
+};
+
+// Thread-local dynamic arrays for subs and rets
+static __thread ERL_NIF_TERM* subs = NULL;
+static __thread ERL_NIF_TERM* rets = NULL;
+static __thread size_t allocated_size = 0;
 
 struct rsn {
   struct betree_reason_map_t *reason;
@@ -219,6 +236,9 @@ save_search_state(ErlNifEnv *env, size_t attr_domain_count,
                   struct timespec *current) {
   struct search_state *search_state =
       enif_alloc_resource(MEM_SEARCH_STATE, sizeof(*search_state));
+  if (search_state == NULL) {
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
   search_state_init(search_state);
 
   ERL_NIF_TERM search_state_term = enif_make_resource(env, search_state);
@@ -256,9 +276,11 @@ static ERL_NIF_TERM make_atom(ErlNifEnv *env, const char *name) {
 
 static void cleanup_betree(ErlNifEnv *env, void *obj) {
   (void)env;
-  struct betree *betree = obj;
-  if (betree->subs_data != NULL) enif_free(betree->subs_data);
-  betree_deinit(betree);
+  struct betree_resource *betree_res = obj;
+  if (betree_res->betree->subs_data != NULL) enif_free(betree_res->betree->subs_data);
+  if (betree_res->sub_index != NULL) enif_free(betree_res->sub_index);
+  betree_deinit(betree_res->betree);
+  enif_free(betree_res->betree);
 }
 
 static void cleanup_betree_err(ErlNifEnv *env, void *obj) {
@@ -308,6 +330,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   atom_bad_constant = make_atom(env, "bad_constant");
   atom_bad_binary = make_atom(env, "bad_binary");
   atom_failed = make_atom(env, "failed");
+  atom_mem_alloc_failed = make_atom(env, "mem_alloc_failed");
 
   atom_int = make_atom(env, "int");
   ;
@@ -371,10 +394,15 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   return 0;
 }
 
+static struct betree_resource *get_betree_resource(ErlNifEnv *env, const ERL_NIF_TERM term) {
+  struct betree_resource *betree_res = NULL;
+  enif_get_resource(env, term, MEM_BETREE, (void *)&betree_res);
+  return betree_res;
+}
+
 static struct betree *get_betree(ErlNifEnv *env, const ERL_NIF_TERM term) {
-  struct betree *betree = NULL;
-  enif_get_resource(env, term, MEM_BETREE, (void *)&betree);
-  return betree;
+  struct betree_resource *betree_res = get_betree_resource(env, term);
+  return betree_res ? betree_res->betree : NULL;
 }
 
 static struct evt *get_evt(ErlNifEnv *env, const ERL_NIF_TERM term) {
@@ -905,12 +933,24 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  struct betree *betree = enif_alloc_resource(MEM_BETREE, sizeof(*betree));
-  betree_init(betree);
+  struct betree_resource *betree_res = enif_alloc_resource(MEM_BETREE, sizeof(*betree_res));
+  if (betree_res == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
+  betree_res->betree = (struct betree*)enif_alloc(sizeof(struct betree));
+  if (betree_res->betree == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
+  betree_init(betree_res->betree);
+  betree_res->sub_index = NULL;
+  betree_res->sub_capacity = 0;
+  betree_res->sub_count = 0;
 
-  ERL_NIF_TERM term = enif_make_resource(env, betree);
+  ERL_NIF_TERM term = enif_make_resource(env, betree_res);
 
-  enif_release_resource(betree);
+  enif_release_resource(betree_res);
 
   unsigned int list_len;
   if (!enif_get_list_length(env, argv[0], &list_len)) {
@@ -919,13 +959,13 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
   }
 
   const ERL_NIF_TERM *ranks = NULL;
-  /* if (argc == 2) {
+  if (argc == 2) {
     if (!enif_is_map(env, argv[1])) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
     ranks = &argv[1];
-  } */
+  }
 
   ERL_NIF_TERM head;
   ERL_NIF_TERM tail = argv[0];
@@ -941,7 +981,7 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
       goto cleanup;
     }
 
-    if (!add_domains(env, betree, head, inner_list_len, ranks)) {
+    if (!add_domains(env, betree_res->betree, head, inner_list_len, ranks)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1062,6 +1102,10 @@ static ERL_NIF_TERM nif_betree_make_sub(ErlNifEnv *env, int argc,
   }
 
   struct betree *betree = get_betree(env, argv[0]);
+  if (betree == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
 
   betree_sub_t sub_id;
   if (!enif_get_uint64(env, argv[1], &sub_id)) {
@@ -1079,6 +1123,10 @@ static ERL_NIF_TERM nif_betree_make_sub(ErlNifEnv *env, int argc,
   }
 
   constants = enif_alloc(length * sizeof(*constants));
+  if (constants == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   constant_count = length;
   for (unsigned int i = 0; i < length; i++) {
     constants[i] = NULL;
@@ -1140,6 +1188,10 @@ static ERL_NIF_TERM nif_betree_make_sub(ErlNifEnv *env, int argc,
   }
 
   struct sub *sub = enif_alloc_resource(MEM_SUB, sizeof(*sub));
+  if (sub == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   sub->sub = betree_sub;
 
   ERL_NIF_TERM sub_term = enif_make_resource(env, sub);
@@ -1159,34 +1211,35 @@ cleanup:
   return retval;
 }
 
-struct sub_info {
-  ERL_NIF_TERM sub_id;
-};
-
-static struct sub_info* sub_index;
-static size_t sub_capacity;
-static size_t sub_count;
-
-static void prepare_subs_data(struct betree* betree) {
-  betree->subs_data = (struct subs_data*)enif_alloc(sizeof(struct subs_data));
-  betree->subs_data->array = (void**)enif_alloc(sub_count * sizeof(void*));
-  betree->subs_data->limit = sub_count;
-  betree->subs_data->count = 0;
-  betree_prepare_sub_data(betree);
+static bool prepare_subs_data(struct betree_resource* betree_res) {
+  betree_res->betree->subs_data = (struct subs_data*)enif_alloc(sizeof(struct subs_data));
+  if (betree_res->betree->subs_data == NULL) {
+    return false;
+  }
+  betree_res->betree->subs_data->array = (void**)enif_alloc(betree_res->sub_count * sizeof(void*));
+  if (betree_res->betree->subs_data->array == NULL) {
+    enif_free(betree_res->betree->subs_data);
+    betree_res->betree->subs_data = NULL;
+    return false;
+  }
+  betree_res->betree->subs_data->limit = betree_res->sub_count;
+  betree_res->betree->subs_data->count = 0;
+  betree_prepare_sub_data(betree_res->betree);
+  return true;
 }
 
-static bool index_sub(ErlNifEnv* env, betree_sub_t sub_id, void** ptr) {
+static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree_sub_t sub_id, void** ptr) {
   // Check if we need to allocate or grow the array
-  if (sub_count >= sub_capacity) {
-    size_t new_capacity = (sub_capacity == 0) ? 64 : sub_capacity * 2;
+  if (betree_res->sub_count >= betree_res->sub_capacity) {
+    size_t new_capacity = (betree_res->sub_capacity == 0) ? 64 : betree_res->sub_capacity * 2;
     struct sub_info* new_index;
 
-    if (sub_index == NULL) {
+    if (betree_res->sub_index == NULL) {
       // Initial allocation
       new_index = (struct sub_info*)enif_alloc(new_capacity * sizeof(struct sub_info));
     } else {
       // Reallocation
-      new_index = (struct sub_info*)enif_realloc(sub_index, new_capacity * sizeof(struct sub_info));
+      new_index = (struct sub_info*)enif_realloc(betree_res->sub_index, new_capacity * sizeof(struct sub_info));
     }
 
     if (new_index == NULL) {
@@ -1194,18 +1247,18 @@ static bool index_sub(ErlNifEnv* env, betree_sub_t sub_id, void** ptr) {
       return false;
     }
 
-    sub_index = new_index;
-    sub_capacity = new_capacity;
+    betree_res->sub_index = new_index;
+    betree_res->sub_capacity = new_capacity;
   }
 
   // Add new element at the end of the array
-  sub_index[sub_count].sub_id = enif_make_uint64(env, sub_id);
+  betree_res->sub_index[betree_res->sub_count].sub_id = enif_make_uint64(env, sub_id);
 
   // Return index of the newly added element
-  *ptr = (void*)sub_count;
+  *ptr = (void*)betree_res->sub_count;
 
   // Increment count
-  sub_count++;
+  betree_res->sub_count++;
 
   return true;
 }
@@ -1222,7 +1275,12 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  struct betree *betree = get_betree(env, argv[0]);
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+  struct betree *betree = betree_res->betree;
 
   betree_sub_t sub_id;
   if (!enif_get_uint64(env, argv[1], &sub_id)) {
@@ -1240,6 +1298,10 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
   }
 
   constants = enif_alloc(length * sizeof(*constants));
+  if (constants == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   constant_count = length;
   for (unsigned int i = 0; i < length; i++) {
     constants[i] = NULL;
@@ -1300,8 +1362,8 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  if (!index_sub(env, sub_id, &betree_sub->data)) {
-    retval = enif_make_tuple2(env, atom_error, atom_failed);
+  if (!index_sub(env, betree_res, sub_id, &betree_sub->data)) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
     goto cleanup;
   }
 
@@ -1426,34 +1488,26 @@ cleanup:
   return retval;
 }
 
-struct ids_with_reasons {
-  // subscribers
-  ERL_NIF_TERM* subs;
-  // results
-  ERL_NIF_TERM* rets;
-};
-
 static void acc_ret(void *arg, void *data, bool success, const void *context) {
   size_t index = (size_t)data;
+  struct sub_info* sub_index = (struct sub_info*) arg;
   struct sub_info* info = &sub_index[index];
-  struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
-  this->subs[index] = info->sub_id;
-  this->rets[index] = success ? atom_ok : context ? (ERL_NIF_TERM)context : atom_error;
+  subs[index] = info->sub_id;
+  rets[index] = success ? atom_ok : context ? (ERL_NIF_TERM)context : atom_error;
 }
 
 static void acc_arr(void* arg, void** data, size_t count, const void* context) {
-  struct ids_with_reasons *this = (struct ids_with_reasons*) arg;
+  struct sub_info* sub_index = (struct sub_info*) arg;
   ERL_NIF_TERM ret = context ? (ERL_NIF_TERM)context : atom_error;
   for (size_t i=0; i<count; i++) {
     size_t index = (size_t)data[i];
     struct sub_info* info = &sub_index[index];
-    this->subs[index] = info->sub_id;
-    this->rets[index] = ret;
+    subs[index] = info->sub_id;
+    rets[index] = ret;
   }
 }
 
-static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
-                                      const ERL_NIF_TERM argv[]) {
+static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
   struct report *report = NULL;
   size_t pred_index = 0;
@@ -1464,11 +1518,12 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  struct betree *betree = get_betree(env, argv[0]);
-  if (betree == NULL) {
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
     retval = enif_make_badarg(env);
     goto cleanup;
   }
+  struct betree *betree = betree_res->betree;
 
   unsigned int list_len;
   if (!enif_get_list_length(env, argv[1], &list_len)) {
@@ -1502,20 +1557,32 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
     pred_index += (tuple_len - 1);
   }
 
-  static ERL_NIF_TERM subs[10000];
-  static ERL_NIF_TERM rets[10000];
-  for (int i=0; i<5000; i++) rets[i] = atom_ok;
-  struct ids_with_reasons acc = {
-    // .env = env,
-    // .ids = enif_make_list(env, 0),
-    // .map = enif_make_new_map(env)
-    .subs = subs, // enif_alloc(sub_count * sizeof(ERL_NIF_TERM)),
-    .rets = rets  // enif_alloc(sub_count * sizeof(ERL_NIF_TERM))
-  };
+  // Ensure arrays are allocated and sized correctly
+  if (allocated_size < betree_res->sub_count) {
+    if (subs != NULL) {
+      enif_free(subs);
+      enif_free(rets);
+    }
+
+    subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    rets = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    allocated_size = betree_res->sub_count;
+
+    if (subs == NULL || rets == NULL) {
+      // Allocation failed, clean up and return error
+      if (subs != NULL) enif_free(subs);
+      if (rets != NULL) enif_free(rets);
+      subs = rets = NULL;
+      allocated_size = 0;
+      retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+      goto cleanup;
+    }
+  }
+
   report = make_report();
   report->cb = &acc_ret;
   report->cba = &acc_arr;
-  report->arg = &acc;
+  report->arg = betree_res->sub_index;
   bool result = betree_search_with_event(betree, event, report);
 
   if (result == false) {
@@ -1524,8 +1591,8 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc,
   }
 
   retval = enif_make_tuple3(env, atom_ok,
-    enif_make_list_from_array(env, acc.subs, sub_count),
-    enif_make_list_from_array(env, acc.rets, sub_count)
+    enif_make_list_from_array(env, subs, betree_res->sub_count),
+    enif_make_list_from_array(env, rets, betree_res->sub_count)
   );
 
 cleanup:
@@ -1653,6 +1720,10 @@ static ERL_NIF_TERM nif_betree_search_evt_ids(ErlNifEnv *env, int argc,
   ERL_NIF_TERM head;
   ERL_NIF_TERM tail = argv[2];
   ids = enif_alloc(sz * sizeof(uint64_t));
+  if (ids == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
 
   for (unsigned int i = 0; i < sz; i++) {
     if (!enif_get_list_cell(env, tail, &head, &tail)) {
@@ -1757,6 +1828,10 @@ static ERL_NIF_TERM nif_betree_search_ids(ErlNifEnv *env, int argc,
 
   tail = argv[2];
   ids = enif_alloc(sz * sizeof(uint64_t));
+  if (ids == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
 
   for (unsigned int i = 0; i < sz; i++) {
     if (!enif_get_list_cell(env, tail, &head, &tail)) {
@@ -2021,6 +2096,9 @@ static ERL_NIF_TERM nif_betree_search_iterator(ErlNifEnv *env, int argc,
 
   struct search_iterator *search_iterator =
       enif_alloc_resource(MEM_SEARCH_ITERATOR, sizeof(*search_iterator));
+  if (search_iterator == NULL) {
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
   search_iterator_init(search_iterator);
 
   ERL_NIF_TERM search_iterator_term = enif_make_resource(env, search_iterator);
@@ -2108,6 +2186,9 @@ static ERL_NIF_TERM nif_betree_search_next(ErlNifEnv *env, int argc,
     } else {
       ERL_NIF_TERM *arr =
           enif_alloc(sizeof(ERL_NIF_TERM) * search_iterator->report->matched);
+      if (arr == NULL) {
+        return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+      }
       for (int i = 0; i < search_iterator->report->matched; ++i) {
         arr[i] = enif_make_uint64(env, search_iterator->report->subs[i]);
       }
@@ -2146,6 +2227,9 @@ static ERL_NIF_TERM nif_betree_search_next(ErlNifEnv *env, int argc,
     } else {
       ERL_NIF_TERM *arr =
           enif_alloc(sizeof(ERL_NIF_TERM) * search_iterator->report->matched);
+      if (arr == NULL) {
+        return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+      }
       for (int i = 0; i < search_iterator->report->matched; ++i) {
         arr[i] = enif_make_uint64(env, search_iterator->report->subs[i]);
       }
@@ -2197,6 +2281,9 @@ static ERL_NIF_TERM nif_betree_search_all(ErlNifEnv *env, int argc,
   } else {
     ERL_NIF_TERM *arr =
         enif_alloc(sizeof(ERL_NIF_TERM) * search_iterator->report->matched);
+    if (arr == NULL) {
+      return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    }
     for (int i = 0; i < search_iterator->report->matched; ++i) {
       arr[i] = enif_make_uint64(env, search_iterator->report->subs[i]);
     }
@@ -2733,9 +2820,16 @@ static ERL_NIF_TERM nif_betree_prepare_subs(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  struct betree *betree = get_betree(env, argv[0]);
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
 
-  prepare_subs_data(betree);
+  if (!prepare_subs_data(betree_res)) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   retval = atom_ok;
 
 cleanup:
@@ -2752,6 +2846,10 @@ static ERL_NIF_TERM nif_betree_make_err(ErlNifEnv *env, int argc,
 
   struct betree_err *betree =
       enif_alloc_resource(MEM_BETREE_ERR, sizeof(*betree));
+  if (betree == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   betree_init_err(betree);
 
   ERL_NIF_TERM term = enif_make_resource(env, betree);
@@ -2894,6 +2992,10 @@ static ERL_NIF_TERM nif_betree_make_sub_err(ErlNifEnv *env, int argc,
   }
 
   constants = enif_alloc(length * sizeof(*constants));
+  if (constants == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   constant_count = length;
   for (unsigned int i = 0; i < length; i++) {
     constants[i] = NULL;
@@ -2955,6 +3057,10 @@ static ERL_NIF_TERM nif_betree_make_sub_err(ErlNifEnv *env, int argc,
   }
 
   struct sub *sub = enif_alloc_resource(MEM_SUB, sizeof(*sub));
+  if (sub == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
   sub->sub = betree_sub;
 
   ERL_NIF_TERM sub_term = enif_make_resource(env, sub);
@@ -3207,6 +3313,10 @@ static ERL_NIF_TERM nif_betree_search_evt_ids_err(ErlNifEnv *env, int argc,
   ERL_NIF_TERM head;
   ERL_NIF_TERM tail = argv[2];
   ids = enif_alloc(sz * sizeof(uint64_t));
+  if (ids == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
 
   for (unsigned int i = 0; i < sz; i++) {
     if (!enif_get_list_cell(env, tail, &head, &tail)) {
@@ -3320,6 +3430,10 @@ static ERL_NIF_TERM nif_betree_search_ids_err(ErlNifEnv *env, int argc,
 
   tail = argv[2];
   ids = enif_alloc(sz * sizeof(uint64_t));
+  if (ids == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
 
   for (unsigned int i = 0; i < sz; i++) {
     if (!enif_get_list_cell(env, tail, &head, &tail)) {
@@ -3424,7 +3538,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_add_sub", 4, nif_betree_add_sub, 0},
     {"betree_exists", 2, nif_betree_exists, 0},
     {"betree_search", 2, nif_betree_search, 0},
-    {"betree_search_", 2, nif_betree_search_, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search_", 2, nif_betree_search_, 0},
     {"betree_search", 3, nif_betree_search_t, 0},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
