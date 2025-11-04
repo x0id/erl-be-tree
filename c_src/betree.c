@@ -3528,6 +3528,7 @@ cleanup:
   return retval;
 }
 
+// original function descriptors
 static ErlNifFunc nif_functions[] = {
     {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
     {"betree_make", 1, nif_betree_make, 0},
@@ -3566,4 +3567,87 @@ static ErlNifFunc nif_functions[] = {
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
 };
 
-ERL_NIF_INIT(erl_betree_nif, nif_functions, &load, NULL, NULL, NULL);
+// alternative function descriptors with nif_betree_search_'s dirty flag
+static ErlNifFunc nif_functions_[] = {
+    {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
+    {"betree_make", 1, nif_betree_make, 0},
+    {"betree_make", 2, nif_betree_make, 0},
+    {"betree_make_event", 3, nif_betree_make_event, 0},
+    {"betree_make_sub", 4, nif_betree_make_sub, 0},
+    {"betree_insert_sub", 2, nif_betree_insert_sub, 0},
+    {"betree_add_sub", 4, nif_betree_add_sub, 0},
+    {"betree_exists", 2, nif_betree_exists, 0},
+    {"betree_search", 2, nif_betree_search, 0},
+    {"betree_search_", 2, nif_betree_search_, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search", 3, nif_betree_search_t, 0},
+    {"betree_search_evt", 3, nif_betree_search_evt, 0},
+    {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
+    {"betree_search_ids", 4, nif_betree_search_ids, 0},
+    {"betree_write_dot", 2, betree_write_dot, ERL_DIRTY_JOB_IO_BOUND},
+    {"search_iterator", 2, nif_betree_search_iterator, 0},
+    {"search_next", 1, nif_betree_search_next, 0},
+    {"search_all", 1, nif_betree_search_all, 0},
+    {"search_iterator_release", 1, nif_betree_search_iterator_release, 0},
+    {"search_yield", 4, nif_betree_search_yield, 0},
+    {"search_next_yield", 3, nif_betree_search_next_yield, 0},
+    {"search_ids_yield", 5, nif_betree_search_ids_yield, 0},
+    {"betree_make_sub_ids", 1, nif_betree_make_sub_ids, 0},
+    {"betree_prepare_subs", 1, nif_betree_prepare_subs, 0},
+    {"betree_make_err", 1, nif_betree_make_err, 0},
+    {"betree_make_event_err", 3, nif_betree_make_event_err, 0},
+    {"betree_make_sub_err", 4, nif_betree_make_sub_err, 0},
+    {"betree_insert_sub_err", 2, nif_betree_insert_sub_err, 0},
+    {"betree_search_err", 2, nif_betree_search_err, 0},
+    {"betree_search_err", 3, nif_betree_search_t_err, 0},
+    {"betree_search_evt_err", 3, nif_betree_search_evt_err, 0},
+    {"betree_search_evt_err", 4, nif_betree_search_evt_ids_err, 0},
+    {"betree_search_ids_err", 4, nif_betree_search_ids_err, 0},
+    {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
+    {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
+};
+
+// ERL_NIF_INIT replacement for environment-controlled variants
+#define ERL_NIF_INIT_(NAME, FUNCS, FUNCS_, LOAD, RELOAD, UPGRADE, UNLOAD) \
+ERL_NIF_INIT_PROLOGUE                               \
+ERL_NIF_INIT_GLOB                                   \
+ERL_NIF_INIT_DECL(NAME);                            \
+ERL_NIF_INIT_DECL(NAME)                             \
+{                                                   \
+    static ErlNifEntry entry =                      \
+    {                                               \
+        ERL_NIF_MAJOR_VERSION,                      \
+        ERL_NIF_MINOR_VERSION,                      \
+        #NAME,                                      \
+        sizeof(FUNCS) / sizeof(*FUNCS),             \
+        FUNCS,                                      \
+        LOAD, RELOAD, UPGRADE, UNLOAD,              \
+        ERL_NIF_VM_VARIANT,                         \
+        1,                                          \
+        sizeof(ErlNifResourceTypeInit),             \
+        ERL_NIF_MIN_ERTS_VERSION                    \
+    };                                              \
+    static ErlNifEntry entry_ =                     \
+    {                                               \
+        ERL_NIF_MAJOR_VERSION,                      \
+        ERL_NIF_MINOR_VERSION,                      \
+        #NAME,                                      \
+        sizeof(FUNCS_) / sizeof(*FUNCS_),           \
+        FUNCS_,                                     \
+        LOAD, RELOAD, UPGRADE, UNLOAD,              \
+        ERL_NIF_VM_VARIANT,                         \
+        1,                                          \
+        sizeof(ErlNifResourceTypeInit),             \
+        ERL_NIF_MIN_ERTS_VERSION                    \
+    };                                              \
+    ERL_NIF_INIT_BODY;                              \
+    {                                               \
+        char* selector = getenv("DIRTY_SEARCH");    \
+        if (selector != NULL) {                     \
+            return &entry_;                         \
+        }                                           \
+        return &entry;                              \
+    }                                               \
+}                                                   \
+ERL_NIF_INIT_EPILOGUE
+
+ERL_NIF_INIT_(erl_betree_nif, nif_functions, nif_functions_, &load, NULL, NULL, NULL);
