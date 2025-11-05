@@ -1628,6 +1628,29 @@ static ERL_NIF_TERM nif_betree_search_t(ErlNifEnv *env, int argc,
   return retval;
 }
 
+static ERL_NIF_TERM nif_betree_search_t_(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+  if (argc != 3) {
+    return enif_make_badarg(env);
+  }
+
+  int clock_type = 0;
+  if (!enif_get_int(env, argv[2], &clock_type)) {
+    return enif_make_badarg(env);
+  }
+  clock_type = reverse_get_clock_type(clock_type);
+  struct timespec start, done;
+  clock_gettime(clock_type, &start);
+  ERL_NIF_TERM search_res = nif_betree_search_(env, argc - 1, argv);
+  if (!enif_is_tuple(env, search_res)) {
+    return search_res;
+  }
+  clock_gettime(clock_type, &done);
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  ERL_NIF_TERM retval = enif_make_tuple2(env, search_res, etspent);
+  return retval;
+}
+
 static ERL_NIF_TERM nif_betree_search_evt(ErlNifEnv *env, int argc,
                                           const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
@@ -3541,6 +3564,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_search", 2, nif_betree_search, 0},
     {"betree_search_", 2, nif_betree_search_, 0},
     {"betree_search", 3, nif_betree_search_t, 0},
+    {"betree_search_", 3, nif_betree_search_t_, 0},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
     {"betree_search_ids", 4, nif_betree_search_ids, 0},
@@ -3580,6 +3604,7 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_search", 2, nif_betree_search, 0},
     {"betree_search_", 2, nif_betree_search_, ERL_DIRTY_JOB_CPU_BOUND},
     {"betree_search", 3, nif_betree_search_t, 0},
+    {"betree_search_", 3, nif_betree_search_t_, ERL_DIRTY_JOB_CPU_BOUND},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
     {"betree_search_ids", 4, nif_betree_search_ids, 0},
