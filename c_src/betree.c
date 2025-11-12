@@ -90,6 +90,7 @@ struct betree_resource {
 static __thread ERL_NIF_TERM* subs = NULL;
 static __thread ERL_NIF_TERM* rets = NULL;
 static __thread size_t allocated_size = 0;
+static __thread size_t subs_count = 0;
 
 struct rsn {
   struct betree_reason_map_t *reason;
@@ -1537,6 +1538,35 @@ static void acc_arr(void* arg, void** data, size_t count, const void* context) {
   }
 }
 
+static void update_stats(void *arg, void *data, bool success, const void *context) {
+  struct betree_resource* betree_res = (struct betree_resource*) arg;
+  size_t index = (size_t)data;
+
+  if (success) {
+    // Collect successful matches in subs array
+    struct sub_info* info = &betree_res->sub_index[index];
+    subs[subs_count] = info->sub_id;
+    subs_count++;
+  } else if (betree_res->stats_array != NULL) {
+    // Count failures in stats array
+    size_t offset = index * betree_res->betree->config->attr_domain_count + (betree_var_t)context;
+    atomic_fetch_add(&betree_res->stats_array[offset], 1);
+  }
+}
+
+static void bulk_update_stats(void* arg, void** data, size_t count, const void* context) {
+  struct betree_resource* betree_res = (struct betree_resource*) arg;
+  betree_var_t var_idx = (betree_var_t)context;
+
+  if (betree_res->stats_array != NULL) {
+    for (size_t i = 0; i < count; i++) {
+      size_t index = (size_t)data[i];
+      size_t offset = index * betree_res->betree->config->attr_domain_count + var_idx;
+      atomic_fetch_add(&betree_res->stats_array[offset], 1);
+    }
+  }
+}
+
 static ERL_NIF_TERM nif_betree_search_debug(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
   struct report *report = NULL;
@@ -1685,31 +1715,30 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
     pred_index += (tuple_len - 1);
   }
 
-  // Ensure arrays are allocated and sized correctly
+  // Ensure subs array is allocated and sized correctly
   if (allocated_size < betree_res->sub_count) {
     if (subs != NULL) {
       enif_free(subs);
-      enif_free(rets);
     }
 
     subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
-    rets = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
     allocated_size = betree_res->sub_count;
 
-    if (subs == NULL || rets == NULL) {
+    if (subs == NULL) {
       // Allocation failed, clean up and return error
-      if (subs != NULL) enif_free(subs);
-      if (rets != NULL) enif_free(rets);
-      subs = rets = NULL;
+      subs = NULL;
       allocated_size = 0;
       retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
       goto cleanup;
     }
   }
 
+  // Reset subs count for this search
+  subs_count = 0;
+
   report = make_report();
-  report->cb = &acc_ret;
-  report->cba = &acc_arr;
+  report->cb = &update_stats;
+  report->cba = &bulk_update_stats;
   report->arg = betree_res;
   bool result = betree_search_with_event(betree, event, report);
 
@@ -1718,10 +1747,7 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
     goto cleanup;
   }
 
-  retval = enif_make_tuple3(env, atom_ok,
-    enif_make_list_from_array(env, subs, betree_res->sub_count),
-    enif_make_list_from_array(env, rets, betree_res->sub_count)
-  );
+  retval = enif_make_tuple2(env, atom_ok, enif_make_list_from_array(env, subs, subs_count));
 
 cleanup:
   if (event != NULL) {
