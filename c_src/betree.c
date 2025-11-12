@@ -1,4 +1,5 @@
 #include <float.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -82,6 +83,7 @@ struct betree_resource {
   struct sub_info* sub_index;
   size_t sub_capacity;
   size_t sub_count;
+  _Atomic(uint64_t)* stats_array;
 };
 
 // Thread-local dynamic arrays for subs and rets
@@ -277,8 +279,14 @@ static ERL_NIF_TERM make_atom(ErlNifEnv *env, const char *name) {
 static void cleanup_betree(ErlNifEnv *env, void *obj) {
   (void)env;
   struct betree_resource *betree_res = obj;
-  if (betree_res->betree->subs_data != NULL) enif_free(betree_res->betree->subs_data);
+  if (betree_res->betree->subs_data != NULL) {
+    if (betree_res->betree->subs_data->array != NULL) {
+      enif_free(betree_res->betree->subs_data->array);
+    }
+    enif_free(betree_res->betree->subs_data);
+  }
   if (betree_res->sub_index != NULL) enif_free(betree_res->sub_index);
+  if (betree_res->stats_array != NULL) enif_free(betree_res->stats_array);
   betree_deinit(betree_res->betree);
   enif_free(betree_res->betree);
 }
@@ -947,6 +955,7 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
   betree_res->sub_index = NULL;
   betree_res->sub_capacity = 0;
   betree_res->sub_count = 0;
+  betree_res->stats_array = NULL;
 
   ERL_NIF_TERM term = enif_make_resource(env, betree_res);
 
@@ -1222,6 +1231,19 @@ static bool prepare_subs_data(struct betree_resource* betree_res) {
     betree_res->betree->subs_data = NULL;
     return false;
   }
+
+  // Allocate stats_array
+  size_t stats_array_size = betree_res->sub_count * betree_res->betree->config->attr_domain_count;
+  betree_res->stats_array = (_Atomic(uint64_t)*)enif_alloc(stats_array_size * sizeof(*betree_res->stats_array));
+  if (betree_res->stats_array == NULL) {
+    enif_free(betree_res->betree->subs_data->array);
+    enif_free(betree_res->betree->subs_data);
+    betree_res->betree->subs_data = NULL;
+    return false;
+  }
+  // Initialize all elements to 0
+  memset(betree_res->stats_array, 0, stats_array_size * sizeof(*betree_res->stats_array));
+
   betree_res->betree->subs_data->limit = betree_res->sub_count;
   betree_res->betree->subs_data->count = 0;
   betree_prepare_sub_data(betree_res->betree);
@@ -1490,24 +1512,32 @@ cleanup:
 
 static void acc_ret(void *arg, void *data, bool success, const void *context) {
   size_t index = (size_t)data;
-  struct sub_info* sub_index = (struct sub_info*) arg;
-  struct sub_info* info = &sub_index[index];
+  struct betree_resource* betree_res = (struct betree_resource*) arg;
+  struct sub_info* info = &betree_res->sub_index[index];
   subs[index] = info->sub_id;
-  rets[index] = success ? atom_ok : context ? (ERL_NIF_TERM)context : atom_error;
+  const struct config* config = betree_res->betree->config;
+  betree_var_t var_idx = (betree_var_t)context;
+  const struct attr_domain *ad_ptr = var_idx < config->attr_domain_count ? config->attr_domains[var_idx] : NULL;
+  const void *var = ad_ptr ? ad_ptr->attr_var.data : NULL;
+  rets[index] = success ? atom_ok : var ? (ERL_NIF_TERM)var : atom_error;
 }
 
 static void acc_arr(void* arg, void** data, size_t count, const void* context) {
-  struct sub_info* sub_index = (struct sub_info*) arg;
-  ERL_NIF_TERM ret = context ? (ERL_NIF_TERM)context : atom_error;
+  struct betree_resource* betree_res = (struct betree_resource*) arg;
+  const struct config* config = betree_res->betree->config;
+  betree_var_t var_idx = (betree_var_t)context;
+  const struct attr_domain *ad_ptr = var_idx < config->attr_domain_count ? config->attr_domains[var_idx] : NULL;
+  const void *var = ad_ptr ? ad_ptr->attr_var.data : NULL;
+  ERL_NIF_TERM ret = var ? (ERL_NIF_TERM)var : atom_error;
   for (size_t i=0; i<count; i++) {
     size_t index = (size_t)data[i];
-    struct sub_info* info = &sub_index[index];
+    struct sub_info* info = &betree_res->sub_index[index];
     subs[index] = info->sub_id;
     rets[index] = ret;
   }
 }
 
-static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+static ERL_NIF_TERM nif_betree_search_debug(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
   struct report *report = NULL;
   size_t pred_index = 0;
@@ -1582,7 +1612,105 @@ static ERL_NIF_TERM nif_betree_search_(ErlNifEnv *env, int argc, const ERL_NIF_T
   report = make_report();
   report->cb = &acc_ret;
   report->cba = &acc_arr;
-  report->arg = betree_res->sub_index;
+  report->arg = betree_res;
+  bool result = betree_search_with_event(betree, event, report);
+
+  if (result == false) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  retval = enif_make_tuple3(env, atom_ok,
+    enif_make_list_from_array(env, subs, betree_res->sub_count),
+    enif_make_list_from_array(env, rets, betree_res->sub_count)
+  );
+
+cleanup:
+  if (event != NULL) {
+    betree_free_event(event);
+  }
+  if (report != NULL) {
+    free_report(report);
+  }
+  return retval;
+}
+
+static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+  ERL_NIF_TERM retval;
+  struct report *report = NULL;
+  size_t pred_index = 0;
+  struct betree_event *event = NULL;
+
+  if (argc != 2) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+  struct betree *betree = betree_res->betree;
+
+  unsigned int list_len;
+  if (!enif_get_list_length(env, argv[1], &list_len)) {
+    retval = enif_make_badarg(env);
+    goto cleanup;
+  }
+
+  event = betree_make_event(betree);
+
+  ERL_NIF_TERM head;
+  ERL_NIF_TERM tail = argv[1];
+
+  const ERL_NIF_TERM *tuple;
+  int tuple_len;
+
+  for (unsigned int i = 0; i < list_len; i++) {
+    if (!enif_get_list_cell(env, tail, &head, &tail)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+
+    if (!enif_get_tuple(env, head, &tuple_len, &tuple)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+    pred_index += (tuple_len - 1);
+  }
+
+  // Ensure arrays are allocated and sized correctly
+  if (allocated_size < betree_res->sub_count) {
+    if (subs != NULL) {
+      enif_free(subs);
+      enif_free(rets);
+    }
+
+    subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    rets = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    allocated_size = betree_res->sub_count;
+
+    if (subs == NULL || rets == NULL) {
+      // Allocation failed, clean up and return error
+      if (subs != NULL) enif_free(subs);
+      if (rets != NULL) enif_free(rets);
+      subs = rets = NULL;
+      allocated_size = 0;
+      retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+      goto cleanup;
+    }
+  }
+
+  report = make_report();
+  report->cb = &acc_ret;
+  report->cba = &acc_arr;
+  report->arg = betree_res;
   bool result = betree_search_with_event(betree, event, report);
 
   if (result == false) {
@@ -1628,7 +1756,7 @@ static ERL_NIF_TERM nif_betree_search_t(ErlNifEnv *env, int argc,
   return retval;
 }
 
-static ERL_NIF_TERM nif_betree_search_t_(ErlNifEnv *env, int argc,
+static ERL_NIF_TERM nif_betree_search_debug_t(ErlNifEnv *env, int argc,
                                          const ERL_NIF_TERM argv[]) {
   if (argc != 3) {
     return enif_make_badarg(env);
@@ -1641,7 +1769,30 @@ static ERL_NIF_TERM nif_betree_search_t_(ErlNifEnv *env, int argc,
   clock_type = reverse_get_clock_type(clock_type);
   struct timespec start, done;
   clock_gettime(clock_type, &start);
-  ERL_NIF_TERM search_res = nif_betree_search_(env, argc - 1, argv);
+  ERL_NIF_TERM search_res = nif_betree_search_debug(env, argc - 1, argv);
+  if (!enif_is_tuple(env, search_res)) {
+    return search_res;
+  }
+  clock_gettime(clock_type, &done);
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  ERL_NIF_TERM retval = enif_make_tuple2(env, search_res, etspent);
+  return retval;
+}
+
+static ERL_NIF_TERM nif_betree_search_stats_t(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+  if (argc != 3) {
+    return enif_make_badarg(env);
+  }
+
+  int clock_type = 0;
+  if (!enif_get_int(env, argv[2], &clock_type)) {
+    return enif_make_badarg(env);
+  }
+  clock_type = reverse_get_clock_type(clock_type);
+  struct timespec start, done;
+  clock_gettime(clock_type, &start);
+  ERL_NIF_TERM search_res = nif_betree_search_stats(env, argc - 1, argv);
   if (!enif_is_tuple(env, search_res)) {
     return search_res;
   }
@@ -3562,9 +3713,11 @@ static ErlNifFunc nif_functions[] = {
     {"betree_add_sub", 4, nif_betree_add_sub, 0},
     {"betree_exists", 2, nif_betree_exists, 0},
     {"betree_search", 2, nif_betree_search, 0},
-    {"betree_search_", 2, nif_betree_search_, 0},
+    {"betree_search_debug", 2, nif_betree_search_debug, 0},
+    {"betree_search_stats", 2, nif_betree_search_stats, 0},
     {"betree_search", 3, nif_betree_search_t, 0},
-    {"betree_search_", 3, nif_betree_search_t_, 0},
+    {"betree_search_debug", 3, nif_betree_search_debug_t, 0},
+    {"betree_search_stats", 3, nif_betree_search_stats_t, 0},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
     {"betree_search_ids", 4, nif_betree_search_ids, 0},
@@ -3602,9 +3755,11 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_add_sub", 4, nif_betree_add_sub, 0},
     {"betree_exists", 2, nif_betree_exists, 0},
     {"betree_search", 2, nif_betree_search, 0},
-    {"betree_search_", 2, nif_betree_search_, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search_debug", 2, nif_betree_search_debug, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search_stats", 2, nif_betree_search_stats, ERL_DIRTY_JOB_CPU_BOUND},
     {"betree_search", 3, nif_betree_search_t, 0},
-    {"betree_search_", 3, nif_betree_search_t_, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search_debug", 3, nif_betree_search_debug_t, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_search_stats", 3, nif_betree_search_stats_t, ERL_DIRTY_JOB_CPU_BOUND},
     {"betree_search_evt", 3, nif_betree_search_evt, 0},
     {"betree_search_evt", 4, nif_betree_search_evt_ids, 0},
     {"betree_search_ids", 4, nif_betree_search_ids, 0},

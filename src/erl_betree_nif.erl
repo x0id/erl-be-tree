@@ -14,8 +14,10 @@
     betree_exists/2,
     betree_search/2,
     betree_search/3,
-    betree_search_/2,
-    betree_search_/3,
+    betree_search_debug/2,
+    betree_search_debug/3,
+    betree_search_stats/2,
+    betree_search_stats/3,
     betree_search_evt/3,
     betree_search_evt/4,
     betree_search_ids/4,
@@ -90,9 +92,13 @@ betree_search(_Betree, _Event) ->
     ?nif_stub.
 betree_search(_Betree, _Event, _ClockType) ->
     ?nif_stub.
-betree_search_(_Betree, _Event) ->
+betree_search_debug(_Betree, _Event) ->
     ?nif_stub.
-betree_search_(_Betree, _Event, _ClockType) ->
+betree_search_debug(_Betree, _Event, _ClockType) ->
+    ?nif_stub.
+betree_search_stats(_Betree, _Event) ->
+    ?nif_stub.
+betree_search_stats(_Betree, _Event, _ClockType) ->
     ?nif_stub.
 betree_search_evt(_Betree, _Event, _ClockType) ->
     ?nif_stub.
