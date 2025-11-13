@@ -54,7 +54,8 @@
     betree_parse_reasons/1,
     betree_write_dot_err/2,
     betree_search_ids_err/3,
-    betree_search_ids_err/4
+    betree_search_ids_err/4,
+    betree_stats/1
 ]).
 
 
@@ -254,3 +255,6 @@ betree_search_ids_err(Betree, Event, Ids, ClockType) when is_list(Event), is_int
     erl_betree_nif:betree_search_ids_err(Betree, Event, Ids, ClockType);
 betree_search_ids_err(Betree, Event, Ids, ClockType) when is_reference(Event), is_integer(ClockType) ->
     erl_betree_nif:betree_search_evt_err(Betree, Event, Ids, ClockType).
+
+betree_stats(Betree) ->
+    erl_betree_nif:betree_stats(Betree).

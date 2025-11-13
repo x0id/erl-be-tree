@@ -100,8 +100,6 @@ static ERL_NIF_TERM ids_from_report(ErlNifEnv *env,
                                     const struct report *report);
 static ERL_NIF_TERM ids_from_report_err(ErlNifEnv *env,
                                         const struct report_err *report);
-static ERL_NIF_TERM make_time(ErlNifEnv *env, const struct timespec *start,
-                              const struct timespec *done);
 
 #include "alloc.h"
 #include "hashmap.h"
@@ -1020,6 +1018,14 @@ static int reverse_get_clock_type(int ct) {
     break;
   }
   return res;
+}
+
+// Convert to microseconds
+static ERL_NIF_TERM make_time(ErlNifEnv *env, const struct timespec *start,
+                              const struct timespec *done) {
+  ErlNifSInt64 tspent = (done->tv_sec - start->tv_sec) * 1000000 +
+                        (done->tv_nsec - start->tv_nsec) / 1000;
+  return enif_make_int64(env, tspent);
 }
 
 static ERL_NIF_TERM nif_betree_make_event(ErlNifEnv *env, int argc,
@@ -2151,15 +2157,6 @@ static ERL_NIF_TERM betree_write_dot(ErlNifEnv *env, int argc,
 
   write_dot_to_file(betree, file_name);
   return enif_make_atom(env, "ok");
-}
-
-// Convert to microseconds
-static ERL_NIF_TERM make_time(ErlNifEnv *env, const struct timespec *start,
-                              const struct timespec *done) {
-  ErlNifSInt64 tspent = (done->tv_sec - start->tv_sec) * 1000000 +
-                        (done->tv_nsec - start->tv_nsec) / 1000;
-  ERL_NIF_TERM etspent = enif_make_int64(env, tspent);
-  return etspent;
 }
 
 static int cmpfunc(const void *a, const void *b) {
@@ -3709,22 +3706,116 @@ void print_betree(const struct betree* betree);
 
 static ERL_NIF_TERM nif_betree_print(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
-  ERL_NIF_TERM retval = atom_ok;
-
   if (argc != 1) {
-    retval = enif_make_badarg(env);
-    goto cleanup;
+    return enif_make_badarg(env);
   }
 
   struct betree *betree = get_betree(env, argv[0]);
   if (betree == NULL) {
-    retval = enif_make_badarg(env);
-    goto cleanup;
+    return enif_make_badarg(env);
   }
 
   print_betree(betree);
 
+  return atom_ok;
+}
+
+static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betree_res) {
+  ERL_NIF_TERM* outer_keys = NULL;
+  ERL_NIF_TERM* outer_values = NULL;
+  ERL_NIF_TERM* inner_keys = NULL;
+  ERL_NIF_TERM* inner_values = NULL;
+  ERL_NIF_TERM retval;
+
+  if (betree_res->stats_array == NULL) {
+    // Return empty map if no stats available
+    ERL_NIF_TERM empty_map = enif_make_new_map(env);
+    return enif_make_tuple2(env, atom_ok, empty_map);
+  }
+
+  size_t attr_domain_count = betree_res->betree->config->attr_domain_count;
+
+  // Allocate arrays for maximum possible size
+  outer_keys = enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+  outer_values = enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+  inner_keys = enif_alloc(attr_domain_count * sizeof(ERL_NIF_TERM));
+  inner_values = enif_alloc(attr_domain_count * sizeof(ERL_NIF_TERM));
+
+  if (outer_keys == NULL || outer_values == NULL || inner_keys == NULL || inner_values == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
+
+  size_t outer_count = 0;
+
+  for (size_t i = 0; i < betree_res->sub_count; i++) {
+    // Count non-zero entries for this subscription
+    size_t inner_count = 0;
+
+    for (size_t j = 0; j < attr_domain_count; j++) {
+      size_t offset = i * attr_domain_count + j;
+      uint64_t count = atomic_load(&betree_res->stats_array[offset]);
+
+      if (count > 0) {
+        // Get Var from attr_domain
+        const struct attr_domain *ad_ptr = betree_res->betree->config->attr_domains[j];
+        inner_keys[inner_count] = ad_ptr ? (ERL_NIF_TERM)ad_ptr->attr_var.data : atom_error;
+        inner_values[inner_count] = enif_make_uint64(env, count);
+        inner_count++;
+      }
+    }
+
+    // Skip subscription if no non-zero entries
+    if (inner_count == 0) {
+      continue;
+    }
+
+    // Create inner map from arrays with exact count
+    ERL_NIF_TERM inner_map;
+    enif_make_map_from_arrays(env, inner_keys, inner_values, inner_count, &inner_map);
+
+    // Add to outer arrays
+    outer_keys[outer_count] = betree_res->sub_index[i].sub_id;
+    outer_values[outer_count] = inner_map;
+    outer_count++;
+  }
+
+  // Create outer map from arrays with exact count
+  ERL_NIF_TERM result_map;
+  enif_make_map_from_arrays(env, outer_keys, outer_values, outer_count, &result_map);
+  retval = enif_make_tuple2(env, atom_ok, result_map);
+
 cleanup:
+  if (outer_keys) enif_free(outer_keys);
+  if (outer_values) enif_free(outer_values);
+  if (inner_keys) enif_free(inner_keys);
+  if (inner_values) enif_free(inner_values);
+  return retval;
+}
+
+static ERL_NIF_TERM nif_betree_stats(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+  ERL_NIF_TERM retval;
+
+  if (argc != 1) {
+    return enif_make_badarg(env);
+  }
+
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  struct timespec start, done;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  // Build result map: #{SubId => #{Var => Count}}
+  ERL_NIF_TERM result = build_stats_map(env, betree_res);
+
+  clock_gettime(CLOCK_MONOTONIC, &done);
+
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  retval = enif_make_tuple2(env, result, etspent);
   return retval;
 }
 
@@ -3768,6 +3859,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_search_ids_err", 4, nif_betree_search_ids_err, 0},
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
+    {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -3810,6 +3902,7 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_search_ids_err", 4, nif_betree_search_ids_err, 0},
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
+    {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants
