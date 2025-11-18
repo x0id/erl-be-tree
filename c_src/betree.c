@@ -3720,7 +3720,7 @@ static ERL_NIF_TERM nif_betree_print(ErlNifEnv *env, int argc,
   return atom_ok;
 }
 
-static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betree_res) {
+static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betree_res, bool reset) {
   ERL_NIF_TERM* outer_keys = NULL;
   ERL_NIF_TERM* outer_values = NULL;
   ERL_NIF_TERM* inner_keys = NULL;
@@ -3754,7 +3754,14 @@ static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betr
 
     for (size_t j = 0; j < attr_domain_count; j++) {
       size_t offset = i * attr_domain_count + j;
-      uint64_t count = atomic_load(&betree_res->stats_array[offset]);
+      uint64_t count;
+      if (reset) {
+        // Read and reset counter atomically
+        count = atomic_exchange(&betree_res->stats_array[offset], 0);
+      } else {
+        // Just read counter
+        count = atomic_load(&betree_res->stats_array[offset]);
+      }
 
       if (count > 0) {
         // Get Var from attr_domain
@@ -3796,8 +3803,9 @@ cleanup:
 static ERL_NIF_TERM nif_betree_stats(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
+  bool reset = false;
 
-  if (argc != 1) {
+  if (argc != 1 && argc != 2) {
     return enif_make_badarg(env);
   }
 
@@ -3806,11 +3814,22 @@ static ERL_NIF_TERM nif_betree_stats(ErlNifEnv *env, int argc,
     return enif_make_badarg(env);
   }
 
+  // Parse reset parameter if provided
+  if (argc == 2) {
+    if (enif_is_identical(atom_true, argv[1])) {
+      reset = true;
+    } else if (enif_is_identical(atom_false, argv[1])) {
+      reset = false;
+    } else {
+      return enif_make_badarg(env);
+    }
+  }
+
   struct timespec start, done;
   clock_gettime(CLOCK_MONOTONIC, &start);
 
   // Build result map: #{SubId => #{Var => Count}}
-  ERL_NIF_TERM result = build_stats_map(env, betree_res);
+  ERL_NIF_TERM result = build_stats_map(env, betree_res, reset);
 
   clock_gettime(CLOCK_MONOTONIC, &done);
 
@@ -3860,6 +3879,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
     {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_stats", 2, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -3903,6 +3923,7 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
     {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_stats", 2, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants

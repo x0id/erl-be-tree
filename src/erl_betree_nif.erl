@@ -49,7 +49,8 @@
     betree_search_ids_err/4,
     betree_parse_reasons/1,
     betree_write_dot_err/2,
-    betree_stats/1
+    betree_stats/1,
+    betree_stats/2
 ]).
 
 -spec on_load() -> ok.
@@ -162,4 +163,6 @@ betree_write_dot_err(_Betree, _FileName) ->
 %% betree search error reason end
 
 betree_stats(_Betree) ->
+    ?nif_stub.
+betree_stats(_Betree, _Reset) ->
     ?nif_stub.
