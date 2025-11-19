@@ -1627,7 +1627,10 @@ static ERL_NIF_TERM nif_betree_search_debug(ErlNifEnv *env, int argc, const ERL_
   if (allocated_size < betree_res->sub_count) {
     if (subs != NULL) {
       enif_free(subs);
+    }
+    if (rets != NULL) {
       enif_free(rets);
+      rets = NULL;
     }
 
     subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
@@ -1640,6 +1643,13 @@ static ERL_NIF_TERM nif_betree_search_debug(ErlNifEnv *env, int argc, const ERL_
       if (rets != NULL) enif_free(rets);
       subs = rets = NULL;
       allocated_size = 0;
+      retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+      goto cleanup;
+    }
+  } else if (rets == NULL) {
+    // subs is correct size, but rets was freed by betree_search_stats
+    rets = (ERL_NIF_TERM*)enif_alloc(allocated_size * sizeof(ERL_NIF_TERM));
+    if (rets == NULL) {
       retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
       goto cleanup;
     }
@@ -1725,6 +1735,10 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
   if (allocated_size < betree_res->sub_count) {
     if (subs != NULL) {
       enif_free(subs);
+    }
+    if (rets != NULL) {
+      enif_free(rets);
+      rets = NULL;
     }
 
     subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
