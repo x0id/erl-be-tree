@@ -56,7 +56,13 @@
     betree_search_ids_err/3,
     betree_search_ids_err/4,
     betree_stats/1,
-    betree_stats/2
+    betree_stats/2,
+    betree_group_stats/1,
+    betree_group_stats/2,
+    betree_add_sub/5,
+    betree_stats_start/1,
+    betree_stats_stop/1,
+    betree_stats_stop_return/1
 ]).
 
 
@@ -258,7 +264,25 @@ betree_search_ids_err(Betree, Event, Ids, ClockType) when is_reference(Event), i
     erl_betree_nif:betree_search_evt_err(Betree, Event, Ids, ClockType).
 
 betree_stats(Betree) ->
-    erl_betree_nif:betree_stats(Betree).
+    erl_betree_nif:betree_stats(Betree, false, false).
 
 betree_stats(Betree, Reset) ->
-    erl_betree_nif:betree_stats(Betree, Reset).
+    erl_betree_nif:betree_stats(Betree, false, Reset).
+
+betree_group_stats(Betree) ->
+    erl_betree_nif:betree_stats(Betree, true, false).
+
+betree_group_stats(Betree, Reset) ->
+    erl_betree_nif:betree_stats(Betree, true, Reset).
+
+betree_add_sub(Betree, SubId, GroupId, Constants, Expr) ->
+    erl_betree_nif:betree_add_sub(Betree, SubId, GroupId, Constants, Expr).
+
+betree_stats_start(Betree) ->
+    erl_betree_nif:betree_stats_start(Betree).
+
+betree_stats_stop(StatsAccumulator) ->
+    erl_betree_nif:betree_stats_stop(StatsAccumulator, false).
+
+betree_stats_stop_return(StatsAccumulator) ->
+    erl_betree_nif:betree_stats_stop(StatsAccumulator, true).

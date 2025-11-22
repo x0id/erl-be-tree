@@ -65,6 +65,7 @@ static ErlNifResourceType *MEM_EVENT;
 static ErlNifResourceType *MEM_SEARCH_ITERATOR;
 static ErlNifResourceType *MEM_SEARCH_STATE;
 static ErlNifResourceType *MEM_BETREE_REASON;
+static ErlNifResourceType *MEM_SEARCH_STATS;
 
 struct sub {
   const struct betree_sub *sub;
@@ -76,17 +77,35 @@ struct evt {
 
 struct sub_info {
   ERL_NIF_TERM sub_id;
+  size_t group_idx;  // direct index into betree_resource.group_ids (SIZE_MAX if no group)
 };
 
+typedef _Atomic(uint64_t) counter_t;
+
+// betree and associate data
 struct betree_resource {
   struct betree* betree;
+  // subscription mapping and statistics
   struct sub_info* sub_index;
   size_t sub_capacity;
   size_t sub_count;
-  _Atomic(uint64_t)* stats_array;
+  counter_t* sub_stats;
+  // group mapping and statistics
+  ERL_NIF_TERM* group_ids; // array of unique group IDs
+  size_t group_capacity;   // allocated capacity for groups
+  size_t group_count;      // number of unique groups
+  counter_t* group_stats;  // group-level stats: [group][attr_domain]
 };
 
-// Thread-local dynamic arrays for subs and rets
+// stats accumulator for resource-based statistics
+struct stats_resource {
+  struct betree_resource* betree_res; // reference to betree resource
+  betree_var_t* group_results;        // per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
+  size_t attr_domain_count;           // number of attribute domains
+  bool active;                        // whether accumulator is active
+};
+
+// thread-local dynamic arrays for subs and rets
 static __thread ERL_NIF_TERM* subs = NULL;
 static __thread ERL_NIF_TERM* rets = NULL;
 static __thread size_t allocated_size = 0;
@@ -285,7 +304,9 @@ static void cleanup_betree(ErlNifEnv *env, void *obj) {
     enif_free(betree_res->betree->subs_data);
   }
   if (betree_res->sub_index != NULL) enif_free(betree_res->sub_index);
-  if (betree_res->stats_array != NULL) enif_free(betree_res->stats_array);
+  if (betree_res->sub_stats != NULL) enif_free(betree_res->sub_stats);
+  if (betree_res->group_ids != NULL) enif_free(betree_res->group_ids);
+  if (betree_res->group_stats != NULL) enif_free(betree_res->group_stats);
   betree_deinit(betree_res->betree);
   enif_free(betree_res->betree);
 }
@@ -320,6 +341,17 @@ static void cleanup_search_state(ErlNifEnv *env, void *obj) {
   (void)env;
   struct search_state *search_state = obj;
   search_state_deinit(search_state);
+}
+
+static void cleanup_stats_accumulator(ErlNifEnv *env, void *obj) {
+  (void)env;
+  struct stats_resource *acc = obj;
+  if (acc->group_results != NULL) {
+    enif_free(acc->group_results);
+  }
+  if (acc->betree_res != NULL) {
+    enif_release_resource(acc->betree_res);  // Release dependency on betree_res
+  }
 }
 
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
@@ -397,6 +429,11 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   if (MEM_BETREE_REASON == NULL) {
     return -1;
   }
+  MEM_SEARCH_STATS = enif_open_resource_type(
+      env, NULL, "stats_resource", cleanup_stats_accumulator, flags, NULL);
+  if (MEM_SEARCH_STATS == NULL) {
+    return -1;
+  }
 
   return 0;
 }
@@ -443,6 +480,49 @@ static struct betree_reason_map_t *get_reason(ErlNifEnv *env,
   struct rsn *rsn = NULL;
   enif_get_resource(env, term, MEM_BETREE_REASON, (void *)&rsn);
   return rsn->reason;
+}
+
+static struct stats_resource *get_stats_accumulator(ErlNifEnv *env, const ERL_NIF_TERM term) {
+  struct stats_resource *acc = NULL;
+  enif_get_resource(env, term, MEM_SEARCH_STATS, (void *)&acc);
+  return acc;
+}
+
+// Helper function to find or add a group ID in the betree resource global mapping
+static bool find_or_add_global_group(struct betree_resource *betree_res, ERL_NIF_TERM group_id) {
+  // No group_id given
+  if (enif_is_identical(group_id, atom_undefined)) {
+    betree_res->sub_index[betree_res->sub_count].group_idx = SIZE_MAX; // No group
+    return true;
+  }
+
+  // Look for existing group in global mapping
+  for (size_t idx = 0; idx < betree_res->group_count; idx++) {
+    if (enif_is_identical(betree_res->group_ids[idx], group_id)) {
+      betree_res->sub_index[betree_res->sub_count].group_idx = idx;
+      return true;
+    }
+  }
+
+  // Need to add new group - check capacity
+  if (betree_res->group_count >= betree_res->group_capacity) {
+    size_t new_capacity = (betree_res->group_capacity == 0) ? 64 : betree_res->group_capacity * 2;
+    ERL_NIF_TERM *new_group_ids = enif_realloc(betree_res->group_ids, new_capacity * sizeof(ERL_NIF_TERM));
+
+    if (new_group_ids == NULL) {
+      // Memory allocation failed, can't add new group
+      betree_res->sub_index[betree_res->sub_count].group_idx = SIZE_MAX;
+      return false;
+    }
+
+    betree_res->group_ids = new_group_ids;
+    betree_res->group_capacity = new_capacity;
+  }
+
+  // Add new group
+  betree_res->group_ids[betree_res->group_count] = group_id;
+  betree_res->sub_index[betree_res->sub_count].group_idx = betree_res->group_count++;
+  return true;
 }
 
 static char *alloc_string(ErlNifBinary bin) {
@@ -954,7 +1034,11 @@ static ERL_NIF_TERM nif_betree_make(ErlNifEnv *env, int argc,
   betree_res->sub_index = NULL;
   betree_res->sub_capacity = 0;
   betree_res->sub_count = 0;
-  betree_res->stats_array = NULL;
+  betree_res->sub_stats = NULL;
+  betree_res->group_ids = NULL;
+  betree_res->group_capacity = 0;
+  betree_res->group_count = 0;
+  betree_res->group_stats = NULL;
 
   ERL_NIF_TERM term = enif_make_resource(env, betree_res);
 
@@ -1230,34 +1314,59 @@ cleanup:
 static bool prepare_subs_data(struct betree_resource* betree_res) {
   betree_res->betree->subs_data = (struct subs_data*)enif_alloc(sizeof(struct subs_data));
   if (betree_res->betree->subs_data == NULL) {
-    return false;
-  }
-  betree_res->betree->subs_data->array = (void**)enif_alloc(betree_res->sub_count * sizeof(void*));
-  if (betree_res->betree->subs_data->array == NULL) {
-    enif_free(betree_res->betree->subs_data);
-    betree_res->betree->subs_data = NULL;
-    return false;
+    goto cleanup;
   }
 
-  // Allocate stats_array
+  betree_res->betree->subs_data->array = (void**)enif_alloc(betree_res->sub_count * sizeof(void*));
+  if (betree_res->betree->subs_data->array == NULL) {
+    goto cleanup;
+  }
+
+  // Allocate sub_stats
   size_t stats_array_size = betree_res->sub_count * betree_res->betree->config->attr_domain_count;
-  betree_res->stats_array = (_Atomic(uint64_t)*)enif_alloc(stats_array_size * sizeof(*betree_res->stats_array));
-  if (betree_res->stats_array == NULL) {
-    enif_free(betree_res->betree->subs_data->array);
-    enif_free(betree_res->betree->subs_data);
-    betree_res->betree->subs_data = NULL;
-    return false;
+  betree_res->sub_stats = (counter_t*)enif_alloc(stats_array_size * sizeof(counter_t));
+  if (betree_res->sub_stats == NULL) {
+    goto cleanup;
   }
   // Initialize all elements to 0
-  memset(betree_res->stats_array, 0, stats_array_size * sizeof(*betree_res->stats_array));
+  memset(betree_res->sub_stats, 0, stats_array_size * sizeof(counter_t));
+
+  // Allocate group_stats if we have groups
+  if (betree_res->group_count > 0) {
+    size_t group_stats_size = betree_res->group_count * betree_res->betree->config->attr_domain_count;
+    betree_res->group_stats = (counter_t*)enif_alloc(group_stats_size * sizeof(counter_t));
+    if (betree_res->group_stats == NULL) {
+      goto cleanup;
+    }
+    // Initialize group stats to 0
+    memset(betree_res->group_stats, 0, group_stats_size * sizeof(counter_t));
+  }
 
   betree_res->betree->subs_data->limit = betree_res->sub_count;
   betree_res->betree->subs_data->count = 0;
   betree_prepare_sub_data(betree_res->betree);
   return true;
+
+cleanup:
+  if (betree_res->group_stats != NULL) {
+    enif_free(betree_res->group_stats);
+    betree_res->group_stats = NULL;
+  }
+  if (betree_res->sub_stats != NULL) {
+    enif_free(betree_res->sub_stats);
+    betree_res->sub_stats = NULL;
+  }
+  if (betree_res->betree->subs_data != NULL) {
+    if (betree_res->betree->subs_data->array != NULL) {
+      enif_free(betree_res->betree->subs_data->array);
+    }
+    enif_free(betree_res->betree->subs_data);
+    betree_res->betree->subs_data = NULL;
+  }
+  return false;
 }
 
-static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree_sub_t sub_id, void** ptr) {
+static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree_sub_t sub_id, ERL_NIF_TERM group_id, void** ptr) {
   // Check if we need to allocate or grow the array
   if (betree_res->sub_count >= betree_res->sub_capacity) {
     size_t new_capacity = (betree_res->sub_capacity == 0) ? 64 : betree_res->sub_capacity * 2;
@@ -1265,10 +1374,10 @@ static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree
 
     if (betree_res->sub_index == NULL) {
       // Initial allocation
-      new_index = (struct sub_info*)enif_alloc(new_capacity * sizeof(struct sub_info));
+      new_index = (struct sub_info*)enif_alloc(new_capacity * sizeof(*new_index));
     } else {
       // Reallocation
-      new_index = (struct sub_info*)enif_realloc(betree_res->sub_index, new_capacity * sizeof(struct sub_info));
+      new_index = (struct sub_info*)enif_realloc(betree_res->sub_index, new_capacity * sizeof(*new_index));
     }
 
     if (new_index == NULL) {
@@ -1282,6 +1391,9 @@ static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree
 
   // Add new element at the end of the array
   betree_res->sub_index[betree_res->sub_count].sub_id = enif_make_uint64(env, sub_id);
+
+  // Find or add group and store the index
+  if (!find_or_add_global_group(betree_res, group_id)) return false;
 
   // Return index of the newly added element
   *ptr = (void*)betree_res->sub_count;
@@ -1299,9 +1411,16 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
   char *expr = NULL;
   size_t constant_count = 0;
   struct betree_constant **constants = NULL;
-  if (argc != 4) {
+  ERL_NIF_TERM group_id = atom_undefined;  // Default to undefined
+
+  if (argc != 4 && argc != 5) {
     retval = enif_make_tuple2(env, atom_error, atom_bad_arity);
     goto cleanup;
+  }
+
+  // If 5 arguments provided, the 3rd argument is GroupId
+  if (argc == 5) {
+    group_id = argv[2];
   }
 
   struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
@@ -1317,11 +1436,15 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
+  // Determine indices for constants and expression based on argc
+  int constants_idx = (argc == 5) ? 3 : 2;
+  int expr_idx = (argc == 5) ? 4 : 3;
+
   ERL_NIF_TERM head;
-  ERL_NIF_TERM tail = argv[2];
+  ERL_NIF_TERM tail = argv[constants_idx];
   unsigned int length;
 
-  if (!enif_get_list_length(env, argv[2], &length)) {
+  if (!enif_get_list_length(env, argv[constants_idx], &length)) {
     retval = enif_make_tuple2(env, atom_error, atom_bad_constant_list);
     goto cleanup;
   }
@@ -1373,7 +1496,7 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     constants[i] = betree_make_integer_constant(constant_name, value);
   }
 
-  if (!enif_inspect_iolist_as_binary(env, argv[3], &bin)) {
+  if (!enif_inspect_iolist_as_binary(env, argv[expr_idx], &bin)) {
     retval = enif_make_tuple2(env, atom_error, atom_bad_binary);
     goto cleanup;
   }
@@ -1391,7 +1514,7 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  if (!index_sub(env, betree_res, sub_id, &betree_sub->data)) {
+  if (!index_sub(env, betree_res, sub_id, group_id, &betree_sub->data)) {
     retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
     goto cleanup;
   }
@@ -1553,10 +1676,10 @@ static void update_stats(void *arg, void *data, bool success, const void *contex
     struct sub_info* info = &betree_res->sub_index[index];
     subs[subs_count] = info->sub_id;
     subs_count++;
-  } else if (betree_res->stats_array != NULL) {
+  } else if (betree_res->sub_stats != NULL) {
     // Count failures in stats array
     size_t offset = index * betree_res->betree->config->attr_domain_count + (betree_var_t)context;
-    atomic_fetch_add(&betree_res->stats_array[offset], 1);
+    atomic_fetch_add(&betree_res->sub_stats[offset], 1);
   }
 }
 
@@ -1564,11 +1687,65 @@ static void bulk_update_stats(void* arg, void** data, size_t count, const void* 
   struct betree_resource* betree_res = (struct betree_resource*) arg;
   betree_var_t var_idx = (betree_var_t)context;
 
-  if (betree_res->stats_array != NULL) {
+  if (betree_res->sub_stats != NULL) {
     for (size_t i = 0; i < count; i++) {
       size_t index = (size_t)data[i];
       size_t offset = index * betree_res->betree->config->attr_domain_count + var_idx;
-      atomic_fetch_add(&betree_res->stats_array[offset], 1);
+      atomic_fetch_add(&betree_res->sub_stats[offset], 1);
+    }
+  }
+}
+
+// Group-based stats accumulation structure
+struct group_stats_context {
+  struct sub_info* sub_index;           // Direct pointer to subscription index
+  size_t group_count;            // Number of groups
+  betree_var_t* group_results;          // Per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
+  size_t attr_domain_count;             // Number of attribute domains
+  ErlNifEnv* env;
+};
+
+static void update_group_stats(void *arg, void *data, bool success, const void *context) {
+  struct group_stats_context* gctx = (struct group_stats_context*) arg;
+  size_t index = (size_t)data;
+  struct sub_info* info = &gctx->sub_index[index];
+  size_t group_idx = info->group_idx;
+  bool has_valid_group = group_idx < gctx->group_count;
+
+  if (success) {
+    // Mark subscription as passed - collect it in subs array
+    subs[subs_count] = info->sub_id;
+    subs_count++;
+
+    // If this subscription has a group, mark group as passed
+    if (has_valid_group) {
+      gctx->group_results[group_idx] = 1;
+    }
+  } else {
+    // Handle failure: only update if group has no result yet
+    bool should_update = has_valid_group && !gctx->group_results[group_idx];
+
+    if (should_update) {
+      gctx->group_results[group_idx] = (betree_var_t)context + 2;
+    }
+  }
+}
+
+static void bulk_update_group_stats(void* arg, void** data, size_t count, const void* context) {
+  struct group_stats_context* gctx = (struct group_stats_context*) arg;
+
+  // Update group stats based on subscriptions in data array (no success condition)
+  for (size_t i = 0; i < count; i++) {
+    size_t index = (size_t)data[i];
+    struct sub_info* info = &gctx->sub_index[index];
+    size_t group_idx = info->group_idx;
+    bool has_valid_group = group_idx < gctx->group_count;
+
+    // Only update if group has no result yet and group is valid
+    bool should_update = has_valid_group && !gctx->group_results[group_idx];
+
+    if (should_update) {
+      gctx->group_results[group_idx] = (betree_var_t)context + 2;
     }
   }
 }
@@ -1686,13 +1863,28 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
   struct report *report = NULL;
   size_t pred_index = 0;
   struct betree_event *event = NULL;
+  struct stats_resource *acc = NULL;
 
   if (argc != 2) {
     retval = enif_make_badarg(env);
     goto cleanup;
   }
 
-  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  // Check if first argument is a stats accumulator
+  acc = get_stats_accumulator(env, argv[0]);
+  struct betree_resource *betree_res = NULL;
+
+  if (acc != NULL) {
+    // First argument is a stats accumulator
+    if (!acc->active) {
+      retval = enif_make_badarg(env);
+      goto cleanup;
+    }
+    betree_res = acc->betree_res;
+  } else {
+    // First argument should be a betree resource
+    betree_res = get_betree_resource(env, argv[0]);
+  }
   if (betree_res == NULL) {
     retval = enif_make_badarg(env);
     goto cleanup;
@@ -1757,10 +1949,31 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
   subs_count = 0;
 
   report = make_report();
-  report->cb = &update_stats;
-  report->cba = &bulk_update_stats;
-  report->arg = betree_res;
-  bool result = betree_search_with_event(betree, event, report);
+  bool result;
+
+  if (acc != NULL) {
+    // Set up group-based callbacks
+    struct group_stats_context gctx = {
+      .sub_index = betree_res->sub_index,
+      .group_count = betree_res->group_count,
+      .group_results = acc->group_results,
+      .attr_domain_count = acc->attr_domain_count,
+      .env = env
+    };
+
+    report->cb = &update_group_stats;
+    report->cba = &bulk_update_group_stats;
+    report->arg = &gctx;
+
+    result = betree_search_with_event(betree, event, report);
+  } else {
+    // Use regular callbacks
+    report->cb = &update_stats;
+    report->cba = &bulk_update_stats;
+    report->arg = betree_res;
+
+    result = betree_search_with_event(betree, event, report);
+  }
 
   if (result == false) {
     retval = enif_make_badarg(env);
@@ -3741,7 +3954,7 @@ static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betr
   ERL_NIF_TERM* inner_values = NULL;
   ERL_NIF_TERM retval;
 
-  if (betree_res->stats_array == NULL) {
+  if (betree_res->sub_stats == NULL) {
     // Return empty map if no stats available
     ERL_NIF_TERM empty_map = enif_make_new_map(env);
     return enif_make_tuple2(env, atom_ok, empty_map);
@@ -3771,10 +3984,10 @@ static ERL_NIF_TERM build_stats_map(ErlNifEnv *env, struct betree_resource *betr
       uint64_t count;
       if (reset) {
         // Read and reset counter atomically
-        count = atomic_exchange(&betree_res->stats_array[offset], 0);
+        count = atomic_exchange(&betree_res->sub_stats[offset], 0);
       } else {
         // Just read counter
-        count = atomic_load(&betree_res->stats_array[offset]);
+        count = atomic_load(&betree_res->sub_stats[offset]);
       }
 
       if (count > 0) {
@@ -3814,12 +4027,144 @@ cleanup:
   return retval;
 }
 
+static ERL_NIF_TERM build_group_stats_map(ErlNifEnv *env, struct betree_resource *betree_res, bool reset) {
+  ERL_NIF_TERM* group_keys = NULL;
+  ERL_NIF_TERM* group_values = NULL;
+  ERL_NIF_TERM* inner_keys = NULL;
+  ERL_NIF_TERM* inner_values = NULL;
+  ERL_NIF_TERM retval;
+  size_t group_count = betree_res->group_count;
+  counter_t* groups = betree_res->group_stats;
+  size_t attr_count = betree_res->betree->config->attr_domain_count;
+  struct attr_domain **attrs = betree_res->betree->config->attr_domains;
+
+  if (groups == NULL || group_count == 0) {
+    // Return empty map if no group stats available
+    ERL_NIF_TERM empty_map = enif_make_new_map(env);
+    return enif_make_tuple2(env, atom_ok, empty_map);
+  }
+
+  // Allocate arrays for maximum possible size
+  group_keys = enif_alloc(group_count * sizeof(ERL_NIF_TERM));
+  group_values = enif_alloc(group_count * sizeof(ERL_NIF_TERM));
+  inner_keys = enif_alloc(attr_count * sizeof(ERL_NIF_TERM));
+  inner_values = enif_alloc(attr_count * sizeof(ERL_NIF_TERM));
+
+  if (group_keys == NULL || group_values == NULL || inner_keys == NULL || inner_values == NULL) {
+    retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+    goto cleanup;
+  }
+
+  size_t outer_count = 0;
+
+  for (size_t group_idx = 0; group_idx < group_count; group_idx++) {
+    // Count non-zero entries for this group
+    size_t inner_count = 0;
+
+    for (size_t attr_idx = 0; attr_idx < attr_count; attr_idx++) {
+      size_t offset = group_idx * attr_count + attr_idx;
+      uint64_t count;
+      if (reset) {
+        // Read and reset counter atomically
+        count = atomic_exchange(&groups[offset], 0);
+      } else {
+        // Just read counter
+        count = atomic_load(&groups[offset]);
+      }
+
+      if (count > 0) {
+        // Get Var from attr_domain
+        const struct attr_domain *ad_ptr = attrs[attr_idx];
+        inner_keys[inner_count] = ad_ptr ? (ERL_NIF_TERM)ad_ptr->attr_var.data : atom_error;
+        inner_values[inner_count] = enif_make_uint64(env, count);
+        inner_count++;
+      }
+    }
+
+    // Skip group if no non-zero entries
+    if (inner_count == 0) {
+      continue;
+    }
+
+    // Create inner map from arrays with exact count
+    ERL_NIF_TERM inner_map;
+    enif_make_map_from_arrays(env, inner_keys, inner_values, inner_count, &inner_map);
+
+    // Add to outer arrays - get group_id from betree_res global mapping
+    group_keys[outer_count] = betree_res->group_ids[group_idx];
+    group_values[outer_count] = inner_map;
+    outer_count++;
+  }
+
+  // Create outer map from arrays with exact count
+  ERL_NIF_TERM result_map;
+  enif_make_map_from_arrays(env, group_keys, group_values, outer_count, &result_map);
+  retval = enif_make_tuple2(env, atom_ok, result_map);
+
+cleanup:
+  if (group_keys) enif_free(group_keys);
+  if (group_values) enif_free(group_values);
+  if (inner_keys) enif_free(inner_keys);
+  if (inner_values) enif_free(inner_values);
+  return retval;
+}
+
 static ERL_NIF_TERM nif_betree_stats(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]) {
   ERL_NIF_TERM retval;
-  bool reset = false;
+  bool group_stats;
+  bool reset;
 
-  if (argc != 1 && argc != 2) {
+  if (argc != 3) {
+    return enif_make_badarg(env);
+  }
+
+  // Get betree resource
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  // Parse group_stats parameter (argv[1])
+  if (enif_is_identical(atom_true, argv[1])) {
+    group_stats = true;
+  } else if (enif_is_identical(atom_false, argv[1])) {
+    group_stats = false;
+  } else {
+    return enif_make_badarg(env);
+  }
+
+  // Parse reset parameter (argv[2])
+  if (enif_is_identical(atom_true, argv[2])) {
+    reset = true;
+  } else if (enif_is_identical(atom_false, argv[2])) {
+    reset = false;
+  } else {
+    return enif_make_badarg(env);
+  }
+
+  struct timespec start, done;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  ERL_NIF_TERM result;
+  if (group_stats) {
+    // Build group stats map: #{GroupId => #{Var => Count}}
+    result = build_group_stats_map(env, betree_res, reset);
+  } else {
+    // Build regular stats map: #{SubId => #{Var => Count}}
+    result = build_stats_map(env, betree_res, reset);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &done);
+
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  retval = enif_make_tuple2(env, result, etspent);
+  return retval;
+}
+
+static ERL_NIF_TERM nif_betree_stats_start(ErlNifEnv *env, int argc,
+                                           const ERL_NIF_TERM argv[]) {
+  if (argc != 1) {
     return enif_make_badarg(env);
   }
 
@@ -3828,28 +4173,118 @@ static ERL_NIF_TERM nif_betree_stats(ErlNifEnv *env, int argc,
     return enif_make_badarg(env);
   }
 
-  // Parse reset parameter if provided
-  if (argc == 2) {
-    if (enif_is_identical(atom_true, argv[1])) {
-      reset = true;
-    } else if (enif_is_identical(atom_false, argv[1])) {
-      reset = false;
-    } else {
-      return enif_make_badarg(env);
+  // Require groups for stats collection
+  if (betree_res->group_count == 0) {
+    return enif_make_badarg(env);
+  }
+
+  struct stats_resource *acc = enif_alloc_resource(MEM_SEARCH_STATS, sizeof(*acc));
+  if (acc == NULL) {
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
+
+  // Initialize stats accumulator
+  acc->betree_res = betree_res;
+  enif_keep_resource(betree_res);  // Establish dependency on betree_res
+  acc->attr_domain_count = betree_res->betree->config->attr_domain_count;
+  acc->active = true;
+
+  // Allocate group_results array using actual group count
+  size_t group_count = betree_res->group_count;
+  acc->group_results = enif_alloc(group_count * sizeof(betree_var_t));
+
+  if (acc->group_results == NULL) {
+    enif_release_resource(acc);
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
+
+  // Initialize group_results to zeros
+  memset(acc->group_results, 0, group_count * sizeof(betree_var_t));
+
+  ERL_NIF_TERM acc_term = enif_make_resource(env, acc);
+  enif_release_resource(acc);
+
+  return enif_make_tuple2(env, atom_ok, acc_term);
+}
+
+static ERL_NIF_TERM build_accumulator_stats_map(ErlNifEnv *env, struct stats_resource *acc) {
+  struct betree_resource *betree_res = acc->betree_res;
+  size_t group_count = betree_res->group_count;
+  size_t attr_count = acc->attr_domain_count;
+  struct attr_domain **attrs = betree_res->betree->config->attr_domains;
+
+  // Start with empty map
+  ERL_NIF_TERM result_map = enif_make_new_map(env);
+
+  // Process each group in one pass
+  for (size_t group_idx = 0; group_idx < group_count; group_idx++) {
+    betree_var_t x = acc->group_results[group_idx];
+
+    if (x > 1) {
+      // This group had a failure
+      betree_var_t attr_idx = x - 2;
+      if (attr_idx < attr_count) {
+        // Get the attribute term
+        const struct attr_domain *ad_ptr = attrs[attr_idx];
+        ERL_NIF_TERM attr_term = ad_ptr ? (ERL_NIF_TERM)ad_ptr->attr_var.data : atom_error;
+        ERL_NIF_TERM group_id = betree_res->group_ids[group_idx];
+
+        // Check if this attribute already exists in the map
+        ERL_NIF_TERM existing_list;
+        if (enif_get_map_value(env, result_map, attr_term, &existing_list)) {
+          // Attribute exists, prepend the new group to the existing list
+          ERL_NIF_TERM new_list = enif_make_list_cell(env, group_id, existing_list);
+          enif_make_map_put(env, result_map, attr_term, new_list, &result_map);
+        } else {
+          // Attribute doesn't exist, create new list with just this group
+          ERL_NIF_TERM new_list = enif_make_list1(env, group_id);
+          enif_make_map_put(env, result_map, attr_term, new_list, &result_map);
+        }
+      }
     }
   }
 
-  struct timespec start, done;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  return enif_make_tuple2(env, atom_ok, result_map);
+}
 
-  // Build result map: #{SubId => #{Var => Count}}
-  ERL_NIF_TERM result = build_stats_map(env, betree_res, reset);
+static ERL_NIF_TERM nif_betree_stats_stop(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+  if (argc != 2) {
+    return enif_make_badarg(env);
+  }
 
-  clock_gettime(CLOCK_MONOTONIC, &done);
+  struct stats_resource *acc = get_stats_accumulator(env, argv[0]);
+  if (acc == NULL || !acc->active || acc->group_results == NULL) {
+    return enif_make_badarg(env);
+  }
 
-  ERL_NIF_TERM etspent = make_time(env, &start, &done);
-  retval = enif_make_tuple2(env, result, etspent);
-  return retval;
+  // Parse result parameter (argv[1])
+  bool return_stats;
+  if (enif_is_identical(atom_true, argv[1])) {
+    return_stats = true;
+  } else if (enif_is_identical(atom_false, argv[1])) {
+    return_stats = false;
+  } else {
+    return enif_make_badarg(env);
+  }
+
+  // Mark accumulator as inactive
+  acc->active = false;
+
+  if (return_stats) {
+    // Return group statistics map without transferring to betree_res
+    return build_accumulator_stats_map(env, acc);
+  } else {
+    // Transfer statistics to betree_res (original behavior)
+    for (size_t group_idx = 0; group_idx < acc->betree_res->group_count; group_idx++) {
+      betree_var_t x = acc->group_results[group_idx];
+      if (x > 1) {
+        size_t offset = group_idx * acc->attr_domain_count + (x - 2);
+        atomic_fetch_add(&acc->betree_res->group_stats[offset], 1);
+      }
+    }
+    return atom_ok;
+  }
 }
 
 // original function descriptors
@@ -3892,8 +4327,10 @@ static ErlNifFunc nif_functions[] = {
     {"betree_search_ids_err", 4, nif_betree_search_ids_err, 0},
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
-    {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
-    {"betree_stats", 2, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_stats", 3, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_add_sub", 5, nif_betree_add_sub, 0},
+    {"betree_stats_start", 1, nif_betree_stats_start, 0},
+    {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -3936,8 +4373,10 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_search_ids_err", 4, nif_betree_search_ids_err, 0},
     {"betree_parse_reasons", 1, nif_betree_parse_reasons, 0},
     {"betree_write_dot_err", 2, betree_write_dot_err, ERL_DIRTY_JOB_IO_BOUND},
-    {"betree_stats", 1, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
-    {"betree_stats", 2, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_stats", 3, nif_betree_stats, ERL_DIRTY_JOB_CPU_BOUND},
+    {"betree_add_sub", 5, nif_betree_add_sub, 0},
+    {"betree_stats_start", 1, nif_betree_stats_start, 0},
+    {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants
