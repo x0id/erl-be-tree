@@ -62,7 +62,8 @@
     betree_add_sub/5,
     betree_stats_start/1,
     betree_stats_stop/1,
-    betree_stats_stop_return/1
+    betree_stats_stop_return/1,
+    betree_group_vars/1
 ]).
 
 
@@ -286,3 +287,6 @@ betree_stats_stop(StatsAccumulator) ->
 
 betree_stats_stop_return(StatsAccumulator) ->
     erl_betree_nif:betree_stats_stop(StatsAccumulator, true).
+
+betree_group_vars(Betree) ->
+    erl_betree_nif:betree_group_vars(Betree).

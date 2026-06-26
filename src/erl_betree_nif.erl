@@ -52,7 +52,8 @@
     betree_stats/3,
     betree_add_sub/5,
     betree_stats_start/1,
-    betree_stats_stop/2
+    betree_stats_stop/2,
+    betree_group_vars/1
 ]).
 
 -spec on_load() -> ok.
@@ -171,4 +172,6 @@ betree_add_sub(_Betree, _SubId, _GroupId, _Constants, _Expr) ->
 betree_stats_start(_Betree) ->
     ?nif_stub.
 betree_stats_stop(_StatsAccumulator, _ReturnStats) ->
+    ?nif_stub.
+betree_group_vars(_Betree) ->
     ?nif_stub.

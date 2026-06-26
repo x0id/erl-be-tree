@@ -78,6 +78,7 @@ struct evt {
 struct sub_info {
   ERL_NIF_TERM sub_id;
   size_t group_idx;  // direct index into betree_resource.group_ids (SIZE_MAX if no group)
+  const struct betree_sub *sub_ptr;  // direct pointer to the betree_sub in the tree
 };
 
 typedef _Atomic(uint64_t) counter_t;
@@ -1366,7 +1367,7 @@ cleanup:
   return false;
 }
 
-static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree_sub_t sub_id, ERL_NIF_TERM group_id, void** ptr) {
+static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree_sub_t sub_id, ERL_NIF_TERM group_id, const struct betree_sub* sub_ptr, void** ptr) {
   // Check if we need to allocate or grow the array
   if (betree_res->sub_count >= betree_res->sub_capacity) {
     size_t new_capacity = (betree_res->sub_capacity == 0) ? 64 : betree_res->sub_capacity * 2;
@@ -1391,6 +1392,7 @@ static bool index_sub(ErlNifEnv* env, struct betree_resource* betree_res, betree
 
   // Add new element at the end of the array
   betree_res->sub_index[betree_res->sub_count].sub_id = enif_make_uint64(env, sub_id);
+  betree_res->sub_index[betree_res->sub_count].sub_ptr = sub_ptr;
 
   // Find or add group and store the index
   if (!find_or_add_global_group(betree_res, group_id)) return false;
@@ -1514,7 +1516,7 @@ static ERL_NIF_TERM nif_betree_add_sub(ErlNifEnv *env, int argc,
     goto cleanup;
   }
 
-  if (!index_sub(env, betree_res, sub_id, group_id, &betree_sub->data)) {
+  if (!index_sub(env, betree_res, sub_id, group_id, betree_sub, &betree_sub->data)) {
     retval = enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
     goto cleanup;
   }
@@ -1703,7 +1705,33 @@ struct group_stats_context {
   betree_var_t* group_results;          // Per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
   size_t attr_domain_count;             // Number of attribute domains
   ErlNifEnv* env;
+  ERL_NIF_TERM* group_ids;             // group_id terms for trace lookup
+  struct attr_domain** attr_domains;   // for var name lookup
 };
+
+#ifdef TRACE_LAST_VAR
+#define TRACE_FLIGHT_ID 619844
+
+static bool is_traced_group(struct group_stats_context* gctx, size_t group_idx) {
+  if (group_idx >= gctx->group_count) return false;
+  ERL_NIF_TERM trace_term = enif_make_ulong(gctx->env, TRACE_FLIGHT_ID);
+  return enif_is_identical(gctx->group_ids[group_idx], trace_term);
+}
+
+static const char* var_name_for(struct group_stats_context* gctx, betree_var_t var_idx) {
+  if (var_idx < gctx->attr_domain_count && gctx->attr_domains[var_idx])
+    return gctx->attr_domains[var_idx]->attr_var.attr;
+  return "?";
+}
+
+static bool is_traced_group_cb(void* arg, void* data) {
+  struct group_stats_context* gctx = (struct group_stats_context*) arg;
+  size_t index = (size_t)data;
+  struct sub_info* info = &gctx->sub_index[index];
+  size_t group_idx = info->group_idx;
+  return is_traced_group(gctx, group_idx);
+}
+#endif
 
 static void update_group_stats(void *arg, void *data, bool success, const void *context) {
   struct group_stats_context* gctx = (struct group_stats_context*) arg;
@@ -1713,17 +1741,26 @@ static void update_group_stats(void *arg, void *data, bool success, const void *
   bool has_valid_group = group_idx < gctx->group_count;
 
   if (success) {
-    // Mark subscription as passed - collect it in subs array
     subs[subs_count] = info->sub_id;
     subs_count++;
 
-    // If this subscription has a group, mark group as passed
     if (has_valid_group) {
+#ifdef TRACE_LAST_VAR
+      if (is_traced_group(gctx, group_idx))
+        fprintf(stderr, "cb PASS: group_idx=%zu var=%s sub_idx=%zu\n",
+            group_idx, var_name_for(gctx, (betree_var_t)context), index);
+#endif
       gctx->group_results[group_idx] = 1;
     }
   } else {
-    // Handle failure: only update if group has no result yet
     bool should_update = has_valid_group && !gctx->group_results[group_idx];
+
+#ifdef TRACE_LAST_VAR
+    if (is_traced_group(gctx, group_idx))
+      fprintf(stderr, "cb FAIL: group_idx=%zu var=%s sub_idx=%zu should_update=%d prior=%llu\n",
+          group_idx, var_name_for(gctx, (betree_var_t)context), index,
+          should_update, (unsigned long long)gctx->group_results[group_idx]);
+#endif
 
     if (should_update) {
       gctx->group_results[group_idx] = (betree_var_t)context + 2;
@@ -1734,15 +1771,19 @@ static void update_group_stats(void *arg, void *data, bool success, const void *
 static void bulk_update_group_stats(void* arg, void** data, size_t count, const void* context) {
   struct group_stats_context* gctx = (struct group_stats_context*) arg;
 
-  // Update group stats based on subscriptions in data array (no success condition)
   for (size_t i = 0; i < count; i++) {
     size_t index = (size_t)data[i];
     struct sub_info* info = &gctx->sub_index[index];
     size_t group_idx = info->group_idx;
     bool has_valid_group = group_idx < gctx->group_count;
-
-    // Only update if group has no result yet and group is valid
     bool should_update = has_valid_group && !gctx->group_results[group_idx];
+
+#ifdef TRACE_LAST_VAR
+    if (is_traced_group(gctx, group_idx))
+      fprintf(stderr, "cba FAIL: group_idx=%zu var=%s sub_idx=%zu should_update=%d prior=%llu\n",
+          group_idx, var_name_for(gctx, (betree_var_t)context), index,
+          should_update, (unsigned long long)gctx->group_results[group_idx]);
+#endif
 
     if (should_update) {
       gctx->group_results[group_idx] = (betree_var_t)context + 2;
@@ -1958,12 +1999,17 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
       .group_count = betree_res->group_count,
       .group_results = acc->group_results,
       .attr_domain_count = acc->attr_domain_count,
-      .env = env
+      .env = env,
+      .group_ids = betree_res->group_ids,
+      .attr_domains = betree_res->betree->config->attr_domains
     };
 
     report->cb = &update_group_stats;
     report->cba = &bulk_update_group_stats;
     report->arg = &gctx;
+#ifdef TRACE_LAST_VAR
+    report->is_trc_cb = &is_traced_group_cb;
+#endif
 
     result = betree_search_with_event(betree, event, report);
   } else {
@@ -4287,6 +4333,70 @@ static ERL_NIF_TERM nif_betree_stats_stop(ErlNifEnv *env, int argc,
   }
 }
 
+// Returns %{group_id => [var_atom]} for all groups, showing which variables
+// each group's subscriptions actually use in their boolean expressions.
+static ERL_NIF_TERM nif_betree_group_vars(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+  if (argc != 1) {
+    return enif_make_badarg(env);
+  }
+
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  size_t group_count = betree_res->group_count;
+  size_t attr_count = betree_res->betree->config->attr_domain_count;
+  struct attr_domain **attrs = betree_res->betree->config->attr_domains;
+
+  // Allocate a bitmask per group to accumulate attr_vars union
+  size_t words_per_sub = (attr_count + 63) / 64;
+  uint64_t *group_masks = enif_alloc(group_count * words_per_sub * sizeof(uint64_t));
+  if (group_masks == NULL) {
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
+  memset(group_masks, 0, group_count * words_per_sub * sizeof(uint64_t));
+
+  // Walk all subs and OR their attr_vars into their group's mask
+  for (size_t i = 0; i < betree_res->sub_count; i++) {
+    size_t group_idx = betree_res->sub_index[i].group_idx;
+    if (group_idx >= group_count) continue;
+    const struct betree_sub *sub = betree_res->sub_index[i].sub_ptr;
+    if (sub == NULL || sub->attr_vars == NULL) continue;
+
+    uint64_t *mask = &group_masks[group_idx * words_per_sub];
+    for (size_t w = 0; w < words_per_sub; w++) {
+      mask[w] |= sub->attr_vars[w];
+    }
+  }
+
+  // Build result map: %{group_id => [var_atom]}
+  ERL_NIF_TERM result_map = enif_make_new_map(env);
+
+  for (size_t g = 0; g < group_count; g++) {
+    uint64_t *mask = &group_masks[g * words_per_sub];
+    ERL_NIF_TERM var_list = enif_make_list(env, 0);
+    bool has_any = false;
+
+    for (size_t i = 0; i < attr_count; i++) {
+      if (test_bit(mask, i)) {
+        has_any = true;
+        const struct attr_domain *ad = attrs[i];
+        ERL_NIF_TERM var_atom = ad ? (ERL_NIF_TERM)ad->attr_var.data : atom_error;
+        var_list = enif_make_list_cell(env, var_atom, var_list);
+      }
+    }
+
+    if (has_any) {
+      enif_make_map_put(env, result_map, betree_res->group_ids[g], var_list, &result_map);
+    }
+  }
+
+  enif_free(group_masks);
+  return enif_make_tuple2(env, atom_ok, result_map);
+}
+
 // original function descriptors
 static ErlNifFunc nif_functions[] = {
     {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
@@ -4331,6 +4441,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_add_sub", 5, nif_betree_add_sub, 0},
     {"betree_stats_start", 1, nif_betree_stats_start, 0},
     {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
+    {"betree_group_vars", 1, nif_betree_group_vars, 0},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -4377,6 +4488,7 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_add_sub", 5, nif_betree_add_sub, 0},
     {"betree_stats_start", 1, nif_betree_stats_start, 0},
     {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
+    {"betree_group_vars", 1, nif_betree_group_vars, 0},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants
