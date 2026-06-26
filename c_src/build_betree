@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-## -*- sh-basic-offset: 2 -*-
-
-if [ ! -d "be-tree" ]; then
-    git clone -b nomatch-stats --single-branch --depth 1 https://github.com/x0id/be-tree.git
-fi
-
-make -C be-tree NIF=true
