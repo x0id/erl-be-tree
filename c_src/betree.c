@@ -1709,30 +1709,6 @@ struct group_stats_context {
   struct attr_domain** attr_domains;   // for var name lookup
 };
 
-#ifdef TRACE_LAST_VAR
-#define TRACE_FLIGHT_ID 619844
-
-static bool is_traced_group(struct group_stats_context* gctx, size_t group_idx) {
-  if (group_idx >= gctx->group_count) return false;
-  ERL_NIF_TERM trace_term = enif_make_ulong(gctx->env, TRACE_FLIGHT_ID);
-  return enif_is_identical(gctx->group_ids[group_idx], trace_term);
-}
-
-static const char* var_name_for(struct group_stats_context* gctx, betree_var_t var_idx) {
-  if (var_idx < gctx->attr_domain_count && gctx->attr_domains[var_idx])
-    return gctx->attr_domains[var_idx]->attr_var.attr;
-  return "?";
-}
-
-static bool is_traced_group_cb(void* arg, void* data) {
-  struct group_stats_context* gctx = (struct group_stats_context*) arg;
-  size_t index = (size_t)data;
-  struct sub_info* info = &gctx->sub_index[index];
-  size_t group_idx = info->group_idx;
-  return is_traced_group(gctx, group_idx);
-}
-#endif
-
 static void update_group_stats(void *arg, void *data, bool success, const void *context) {
   struct group_stats_context* gctx = (struct group_stats_context*) arg;
   size_t index = (size_t)data;
@@ -1745,22 +1721,10 @@ static void update_group_stats(void *arg, void *data, bool success, const void *
     subs_count++;
 
     if (has_valid_group) {
-#ifdef TRACE_LAST_VAR
-      if (is_traced_group(gctx, group_idx))
-        fprintf(stderr, "cb PASS: group_idx=%zu var=%s sub_idx=%zu\n",
-            group_idx, var_name_for(gctx, (betree_var_t)context), index);
-#endif
       gctx->group_results[group_idx] = 1;
     }
   } else {
     bool should_update = has_valid_group && !gctx->group_results[group_idx];
-
-#ifdef TRACE_LAST_VAR
-    if (is_traced_group(gctx, group_idx))
-      fprintf(stderr, "cb FAIL: group_idx=%zu var=%s sub_idx=%zu should_update=%d prior=%llu\n",
-          group_idx, var_name_for(gctx, (betree_var_t)context), index,
-          should_update, (unsigned long long)gctx->group_results[group_idx]);
-#endif
 
     if (should_update) {
       gctx->group_results[group_idx] = (betree_var_t)context + 2;
@@ -1777,13 +1741,6 @@ static void bulk_update_group_stats(void* arg, void** data, size_t count, const 
     size_t group_idx = info->group_idx;
     bool has_valid_group = group_idx < gctx->group_count;
     bool should_update = has_valid_group && !gctx->group_results[group_idx];
-
-#ifdef TRACE_LAST_VAR
-    if (is_traced_group(gctx, group_idx))
-      fprintf(stderr, "cba FAIL: group_idx=%zu var=%s sub_idx=%zu should_update=%d prior=%llu\n",
-          group_idx, var_name_for(gctx, (betree_var_t)context), index,
-          should_update, (unsigned long long)gctx->group_results[group_idx]);
-#endif
 
     if (should_update) {
       gctx->group_results[group_idx] = (betree_var_t)context + 2;
@@ -2007,9 +1964,6 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
     report->cb = &update_group_stats;
     report->cba = &bulk_update_group_stats;
     report->arg = &gctx;
-#ifdef TRACE_LAST_VAR
-    report->is_trc_cb = &is_traced_group_cb;
-#endif
 
     result = betree_search_with_event(betree, event, report);
   } else {
