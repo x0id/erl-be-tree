@@ -35,20 +35,7 @@
 
     search_ids_yield/5,
 
-    % search error reason
-    betree_make_sub_ids/1,
     betree_prepare_subs/1,
-    betree_make_err/1,
-    betree_make_event_err/3,
-    betree_make_sub_err/4,
-    betree_insert_sub_err/2,
-    betree_search_err/2,
-    betree_search_err/3,
-    betree_search_evt_err/3,
-    betree_search_evt_err/4,
-    betree_search_ids_err/4,
-    betree_parse_reasons/1,
-    betree_write_dot_err/2,
     betree_stats/3,
     betree_add_sub/5,
     betree_stats_start/1,
@@ -132,38 +119,8 @@ search_next_yield(_SearchState, _ClockType, _YieldThresholdInMicroseconds) ->
 search_ids_yield(_Betree, _Event, _Ids, _ClockType, _YieldThresholdInMicroseconds) ->
     ?nif_stub.
 
-%% betree search error reason begin
-betree_make_sub_ids(_Betree) ->
-    ?nif_stub.
-
 betree_prepare_subs(_Betree) ->
     ?nif_stub.
-
-betree_make_err(_Domains) ->
-    ?nif_stub.
-betree_make_event_err(_Betree, _Event, _ClockType) ->
-    ?nif_stub.
-betree_make_sub_err(_Betree, _SubId, _Constants, _Expr) ->
-    ?nif_stub.
-betree_insert_sub_err(_Betree, _Sub) ->
-    ?nif_stub.
-betree_search_err(_Betree, _Event) ->
-    ?nif_stub.
-betree_search_err(_Betree, _Event, _ClockType) ->
-    ?nif_stub.
-betree_search_evt_err(_Betree, _Event, _ClockType) ->
-    ?nif_stub.
-betree_search_evt_err(_Betree, _Event, _Ids, _ClockType) ->
-    ?nif_stub.
-betree_search_ids_err(_Betree, _Event, _Ids, _ClockType) ->
-    ?nif_stub.
-
-betree_parse_reasons(_NonMatches) ->
-    ?nif_stub.
-
-betree_write_dot_err(_Betree, _FileName) ->
-    ?nif_stub.
-%% betree search error reason end
 
 betree_stats(_Betree, _Group, _Reset) ->
     ?nif_stub.
