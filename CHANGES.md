@@ -1,4 +1,4 @@
-# v1.6.0 (2026-07-10)
+# v1.5.1 (2026-07-10)
 
 ## Removed
 
@@ -21,6 +21,14 @@ to shrink the NIF surface area ahead of further optimization work:
   `Erlang_Scheduler_friendly_processing_with_BE_Tree.md` (now removed along
   with the feature); the counting-based reduction bookkeeping it relied on
   is removed from the be-tree submodule as well.
+- **`*_ids` subset-search API** — `betree_search_ids/3,4` and the NIF
+  functions backing them, plus the corresponding ids-specific test cases in
+  `betree_search_tests.erl`. This path restricted matching to a
+  caller-supplied subset of subscription IDs; the underlying be-tree
+  submodule also drops its ids-search implementation.
+- **be-tree submodule bumped to `v1.5.2`**, which drops the corresponding
+  `TRACE_LAST_VAR`, `_counting`, `*_err`, and `*_ids` code paths on the C
+  side (see be-tree's own `CHANGES.md` for details).
 
 ---
 
