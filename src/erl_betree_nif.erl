@@ -19,8 +19,6 @@
     betree_search_stats/2,
     betree_search_stats/3,
     betree_search_evt/3,
-    betree_search_evt/4,
-    betree_search_ids/4,
     betree_write_dot/2,
 
     betree_prepare_subs/1,
@@ -81,10 +79,6 @@ betree_search_stats(_Betree, _Event) ->
 betree_search_stats(_Betree, _Event, _ClockType) ->
     ?nif_stub.
 betree_search_evt(_Betree, _Event, _ClockType) ->
-    ?nif_stub.
-betree_search_evt(_Betree, _Event, _Ids, _ClockType) ->
-    ?nif_stub.
-betree_search_ids(_Betree, _Event, _Ids, _ClockType) ->
     ?nif_stub.
 
 betree_write_dot(_Betree, _FileName) ->

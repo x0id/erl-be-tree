@@ -13,8 +13,6 @@
     betree_exists/2,
     betree_search/2,
     betree_search/3,
-    betree_search_ids/3,
-    betree_search_ids/4,
     betree_write_dot/2,
     betree_search_debug/2,
     betree_search_debug/3,
@@ -75,19 +73,6 @@ betree_search(Betree, Event, ClockType) when is_reference(Event), is_integer(Clo
 
 betree_write_dot(Betree, FileName) when is_list(FileName) ->
     erl_betree_nif:betree_write_dot(Betree, FileName).
-
-betree_search_ids(Betree, Event, Ids) ->
-    betree_search_ids(Betree, Event, Ids, ?CLOCK_MONOTONIC). 
-
-% @doc Do search for only those ids which are presented in Ids list
-% Also calculates time spend in NIF. 
-% Time value is in microseconds - the erlang:timestamp resolution.  
-betree_search_ids(_Betree, _Event, [], _CLockType)  ->
-    {{ok, []}, 0};
-betree_search_ids(Betree, Event, Ids, ClockType) when is_list(Event), is_integer(ClockType) ->
-    erl_betree_nif:betree_search_ids(Betree, Event, Ids, ClockType);
-betree_search_ids(Betree, Event, Ids, ClockType) when is_reference(Event), is_integer(ClockType) ->
-    erl_betree_nif:betree_search_evt(Betree, Event, Ids, ClockType).
 
 betree_prepare_subs(Betree) ->
     erl_betree_nif:betree_prepare_subs(Betree).
