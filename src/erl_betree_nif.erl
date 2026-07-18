@@ -26,7 +26,11 @@
     betree_add_sub/5,
     betree_stats_start/1,
     betree_stats_stop/2,
-    betree_group_vars/1
+    betree_group_vars/1,
+
+    betree_prepare_flat/1,
+    betree_search_lazy/2,
+    betree_search_continue/2
 ]).
 
 -spec on_load() -> ok.
@@ -96,4 +100,11 @@ betree_stats_start(_Betree) ->
 betree_stats_stop(_StatsAccumulator, _ReturnStats) ->
     ?nif_stub.
 betree_group_vars(_Betree) ->
+    ?nif_stub.
+
+betree_prepare_flat(_Betree) ->
+    ?nif_stub.
+betree_search_lazy(_BetreeOrAcc, _Event) ->
+    ?nif_stub.
+betree_search_continue(_Continuation, _Updates) ->
     ?nif_stub.

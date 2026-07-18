@@ -17,6 +17,7 @@
 
 #include "dyn_arr.h"
 #include "betree.h"
+#include "flat.h"
 #include "debug.h"
 
 // return values
@@ -54,12 +55,14 @@ static ERL_NIF_TERM atom_disallow_undefined;
 static ERL_NIF_TERM atom_true;
 static ERL_NIF_TERM atom_false;
 static ERL_NIF_TERM atom_undefined;
+static ERL_NIF_TERM atom_unfetched;
 static ERL_NIF_TERM atom_unknown;
 
 static ErlNifResourceType *MEM_BETREE;
 static ErlNifResourceType *MEM_SUB;
 static ErlNifResourceType *MEM_EVENT;
 static ErlNifResourceType *MEM_SEARCH_STATS;
+static ErlNifResourceType *MEM_CONTINUATION;
 
 struct sub {
   const struct betree_sub *sub;
@@ -98,6 +101,23 @@ struct stats_resource {
   betree_var_t* group_results;        // per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
   size_t attr_domain_count;           // number of attribute domains
   bool active;                        // whether accumulator is active
+};
+
+enum search_mode {
+  SEARCH_PLAIN,
+  SEARCH_DEBUG,
+  SEARCH_STATS,
+};
+
+struct continuation_resource {
+  struct betree_resource *betree_res;
+  struct stats_resource *stats_res;
+  struct betree_event *event;
+  struct flat_search_state state;
+  enum search_mode mode;
+  ERL_NIF_TERM *partial_subs;
+  size_t partial_count;
+  size_t partial_capacity;
 };
 
 // thread-local dynamic arrays for subs and rets
@@ -155,7 +175,36 @@ static void cleanup_stats_accumulator(ErlNifEnv *env, void *obj) {
     enif_free(acc->group_results);
   }
   if (acc->betree_res != NULL) {
-    enif_release_resource(acc->betree_res);  // Release dependency on betree_res
+    enif_release_resource(acc->betree_res);
+  }
+}
+
+static void cleanup_continuation(ErlNifEnv *env, void *obj) {
+  (void)env;
+  struct continuation_resource *cont = obj;
+  if (cont->event != NULL) {
+    betree_free_event(cont->event);
+  }
+  if (cont->state.unfetched != NULL) {
+    enif_free(cont->state.unfetched);
+  }
+  if (cont->state.undefined != NULL) {
+    enif_free(cont->state.undefined);
+  }
+  if (cont->state.memoize.pass != NULL || cont->state.memoize.fail != NULL) {
+    free_memoize(cont->state.memoize);
+  }
+  if (cont->state.preds != NULL) {
+    enif_free((void*)cont->state.preds);
+  }
+  if (cont->stats_res != NULL) {
+    enif_release_resource(cont->stats_res);
+  }
+  if (cont->partial_subs != NULL) {
+    enif_free(cont->partial_subs);
+  }
+  if (cont->betree_res != NULL) {
+    enif_release_resource(cont->betree_res);
   }
 }
 
@@ -195,6 +244,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   atom_true = make_atom(env, "true");
   atom_false = make_atom(env, "false");
   atom_undefined = make_atom(env, "undefined");
+  atom_unfetched = make_atom(env, "unfetched");
   atom_unknown = make_atom(env, "unknown");
 
   int flags =
@@ -217,6 +267,11 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   MEM_SEARCH_STATS = enif_open_resource_type(
       env, NULL, "stats_resource", cleanup_stats_accumulator, flags, NULL);
   if (MEM_SEARCH_STATS == NULL) {
+    return -1;
+  }
+  MEM_CONTINUATION = enif_open_resource_type(
+      env, NULL, "continuation", cleanup_continuation, flags, NULL);
+  if (MEM_CONTINUATION == NULL) {
     return -1;
   }
 
@@ -250,6 +305,44 @@ static struct stats_resource *get_stats_accumulator(ErlNifEnv *env, const ERL_NI
   struct stats_resource *acc = NULL;
   enif_get_resource(env, term, MEM_SEARCH_STATS, (void *)&acc);
   return acc;
+}
+
+static struct continuation_resource *get_continuation(ErlNifEnv *env, const ERL_NIF_TERM term) {
+  struct continuation_resource *cont = NULL;
+  enif_get_resource(env, term, MEM_CONTINUATION, (void *)&cont);
+  return cont;
+}
+
+static void save_partial_subs(struct continuation_resource *cont) {
+  size_t total = cont->partial_count + subs_count;
+  if (total > cont->partial_capacity) {
+    size_t new_cap = (total < 64) ? 64 : total * 2;
+    ERL_NIF_TERM *new_buf = enif_alloc(new_cap * sizeof(ERL_NIF_TERM));
+    if (cont->partial_subs != NULL) {
+      memcpy(new_buf, cont->partial_subs, cont->partial_count * sizeof(ERL_NIF_TERM));
+      enif_free(cont->partial_subs);
+    }
+    cont->partial_subs = new_buf;
+    cont->partial_capacity = new_cap;
+  }
+  memcpy(cont->partial_subs + cont->partial_count, subs, subs_count * sizeof(ERL_NIF_TERM));
+  cont->partial_count += subs_count;
+}
+
+static ERL_NIF_TERM make_final_result(ErlNifEnv *env,
+                                      struct continuation_resource *cont) {
+  size_t total = cont->partial_count + subs_count;
+  if (cont->partial_count == 0) {
+    return enif_make_tuple2(env, atom_ok,
+        enif_make_list_from_array(env, subs, subs_count));
+  }
+  ERL_NIF_TERM *all = enif_alloc(total * sizeof(ERL_NIF_TERM));
+  memcpy(all, cont->partial_subs, cont->partial_count * sizeof(ERL_NIF_TERM));
+  memcpy(all + cont->partial_count, subs, subs_count * sizeof(ERL_NIF_TERM));
+  ERL_NIF_TERM result = enif_make_tuple2(env, atom_ok,
+      enif_make_list_from_array(env, all, total));
+  enif_free(all);
+  return result;
 }
 
 // Helper function to find or add a group ID in the betree resource global mapping
@@ -729,6 +822,67 @@ static bool add_variables(ErlNifEnv *env, struct betree *betree,
       continue;
     }
     size_t domain_index = initial_domain_index + i - 1;
+    struct betree_variable_definition def =
+        betree_get_variable_definition(betree, domain_index);
+    bool result;
+    struct betree_variable *variable = NULL;
+    switch (def.type) {
+    case BETREE_BOOLEAN:
+      result = get_boolean(env, element, def.name, &variable);
+      break;
+    case BETREE_INTEGER:
+      result = get_int(env, element, def.name, &variable);
+      break;
+    case BETREE_FLOAT:
+      result = get_float(env, element, def.name, &variable);
+      break;
+    case BETREE_STRING:
+      result = get_binary(env, element, def.name, &variable);
+      break;
+    case BETREE_INTEGER_LIST:
+      result = get_int_list(env, element, def.name, &variable);
+      break;
+    case BETREE_STRING_LIST:
+      result = get_bin_list(env, element, def.name, &variable);
+      break;
+    case BETREE_SEGMENTS:
+      result = get_segments_list(env, element, def.name, &variable);
+      break;
+    case BETREE_FREQUENCY_CAPS:
+      result = get_frequency_caps_list(env, element, def.name, &variable);
+      break;
+    case BETREE_INTEGER_ENUM:
+      result = get_int(env, element, def.name, &variable);
+      break;
+    default:
+      result = false;
+      break;
+    }
+    if (result == false) {
+      if (variable != NULL) {
+        betree_free_variable(variable);
+      }
+      return false;
+    }
+    betree_set_variable(event, domain_index, variable);
+  }
+  return true;
+}
+
+static bool add_variables_lazy(ErlNifEnv *env, struct betree *betree,
+                               struct betree_event *event, const ERL_NIF_TERM *tuple,
+                               int tuple_len, size_t initial_domain_index,
+                               uint64_t *unfetched) {
+  for (int i = 1; i < tuple_len; i++) {
+    ERL_NIF_TERM element = tuple[i];
+    size_t domain_index = initial_domain_index + i - 1;
+    if (enif_is_identical(atom_undefined, element)) {
+      continue;
+    }
+    if (enif_is_identical(atom_unfetched, element)) {
+      set_bit(unfetched, domain_index);
+      continue;
+    }
     struct betree_variable_definition def =
         betree_get_variable_definition(betree, domain_index);
     bool result;
@@ -2458,6 +2612,389 @@ static ERL_NIF_TERM nif_betree_group_vars(ErlNifEnv *env, int argc,
   return enif_make_tuple2(env, atom_ok, result_map);
 }
 
+// --- Flat/lazy search NIF functions ---
+
+static ERL_NIF_TERM nif_betree_prepare_flat(ErlNifEnv *env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
+  if (argc != 1) {
+    return enif_make_badarg(env);
+  }
+
+  struct betree_resource *betree_res = get_betree_resource(env, argv[0]);
+  if (betree_res == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  if (!prepare_subs_data(betree_res)) {
+    return enif_make_tuple2(env, atom_error, atom_mem_alloc_failed);
+  }
+
+  betree_flatten(betree_res->betree);
+
+  return atom_ok;
+}
+
+static ERL_NIF_TERM make_needed_vars_list(ErlNifEnv *env,
+                                          const struct flat_tree *ft,
+                                          struct flat_search_state *state) {
+  const uint8_t *buf = ft->buf;
+  size_t cur = state->cursor;
+  uint8_t tag = buf[cur];
+  cur++;
+
+  if (tag == CHUNK_PNODE) {
+    cur += 4; // skip_length
+    betree_var_t var_id;
+    memcpy(&var_id, buf + cur, sizeof(var_id));
+    return enif_make_list1(env, enif_make_uint64(env, var_id));
+  }
+
+  if (tag == CHUNK_SUB) {
+    void *sub_ptr;
+    memcpy(&sub_ptr, buf + cur, sizeof(sub_ptr));
+    cur += sizeof(void*); // sub
+    cur += sizeof(void*); // data
+    const uint64_t *attr_vars;
+    memcpy(&attr_vars, buf + cur, sizeof(attr_vars));
+
+    size_t dom_cnt = state->config->attr_domain_count;
+    size_t bitmask_words = dom_cnt / 64 + 1;
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (size_t w = 0; w < bitmask_words; w++) {
+      uint64_t bits = attr_vars[w] & state->unfetched[w];
+      while (bits) {
+        uint64_t bit_pos = __builtin_ctzll(bits);
+        betree_var_t var_id = w * 64 + bit_pos;
+        list = enif_make_list_cell(env, enif_make_uint64(env, var_id), list);
+        bits &= bits - 1;
+      }
+    }
+    return list;
+  }
+
+  return enif_make_list(env, 0);
+}
+
+static ERL_NIF_TERM make_continuation_term(ErlNifEnv *env,
+                                           struct continuation_resource *cont) {
+  ERL_NIF_TERM cont_term = enif_make_resource(env, cont);
+  ERL_NIF_TERM needed = make_needed_vars_list(env,
+      &cont->betree_res->betree->flat, &cont->state);
+  return enif_make_tuple3(env, atom_continue, cont_term, needed);
+}
+
+static bool parse_event_lazy(ErlNifEnv *env, struct betree_resource *betree_res,
+                             ERL_NIF_TERM event_list,
+                             struct betree_event **out_event,
+                             uint64_t **out_unfetched) {
+  struct betree *betree = betree_res->betree;
+  unsigned int list_len;
+  if (!enif_get_list_length(env, event_list, &list_len)) {
+    return false;
+  }
+
+  struct betree_event *event = betree_make_event(betree);
+  size_t dom_cnt = betree->config->attr_domain_count;
+  size_t bitmask_words = dom_cnt / 64 + 1;
+  uint64_t *unfetched = (uint64_t*)enif_alloc(bitmask_words * sizeof(uint64_t));
+  memset(unfetched, 0, bitmask_words * sizeof(uint64_t));
+
+  ERL_NIF_TERM head, tail = event_list;
+  size_t pred_index = 0;
+
+  for (unsigned int i = 0; i < list_len; i++) {
+    if (!enif_get_list_cell(env, tail, &head, &tail)) goto fail;
+    const ERL_NIF_TERM *tuple;
+    int tuple_len;
+    if (!enif_get_tuple(env, head, &tuple_len, &tuple)) goto fail;
+    if (!add_variables_lazy(env, betree, event, tuple, tuple_len,
+                            pred_index, unfetched)) goto fail;
+    pred_index += (tuple_len - 1);
+  }
+
+  fill_event(betree->config, event);
+  sort_event_lists(event);
+
+  *out_event = event;
+  *out_unfetched = unfetched;
+  return true;
+
+fail:
+  betree_free_event(event);
+  enif_free(unfetched);
+  return false;
+}
+
+static struct continuation_resource *make_continuation(
+    ErlNifEnv *env, struct betree_resource *betree_res,
+    struct stats_resource *stats_res,
+    struct betree_event *event, uint64_t *unfetched,
+    enum search_mode mode) {
+  struct betree *betree = betree_res->betree;
+  const struct config *config = betree->config;
+  size_t dom_cnt = config->attr_domain_count;
+
+  struct continuation_resource *cont =
+      enif_alloc_resource(MEM_CONTINUATION, sizeof(*cont));
+  memset(cont, 0, sizeof(*cont));
+
+  cont->betree_res = betree_res;
+  enif_keep_resource(betree_res);
+  cont->stats_res = stats_res;
+  if (stats_res != NULL) {
+    enif_keep_resource(stats_res);
+  }
+  cont->event = event;
+  cont->mode = mode;
+
+  const struct betree_variable **preds =
+      make_environment(dom_cnt, event);
+  cont->state.config = config;
+  cont->state.preds = preds;
+  cont->state.unfetched = unfetched;
+  cont->state.undefined = make_undefined(dom_cnt, preds);
+  cont->state.memoize = make_memoize(config->pred_map->memoize_count);
+  cont->state.cursor = 0;
+
+  return cont;
+}
+
+static ERL_NIF_TERM nif_betree_search_lazy(ErlNifEnv *env, int argc,
+                                           const ERL_NIF_TERM argv[]) {
+  if (argc != 2) {
+    return enif_make_badarg(env);
+  }
+
+  struct stats_resource *acc = get_stats_accumulator(env, argv[0]);
+  struct betree_resource *betree_res = NULL;
+  enum search_mode mode;
+
+  if (acc != NULL) {
+    if (!acc->active) return enif_make_badarg(env);
+    betree_res = acc->betree_res;
+    mode = SEARCH_STATS;
+  } else {
+    betree_res = get_betree_resource(env, argv[0]);
+    if (betree_res == NULL) return enif_make_badarg(env);
+    mode = SEARCH_STATS;
+  }
+
+  if (betree_res->betree->flat.buf == NULL) {
+    return enif_make_tuple2(env, atom_error,
+        make_atom(env, "not_prepared"));
+  }
+
+  struct betree_event *event = NULL;
+  uint64_t *unfetched = NULL;
+  if (!parse_event_lazy(env, betree_res, argv[1], &event, &unfetched)) {
+    return enif_make_badarg(env);
+  }
+
+  struct continuation_resource *cont =
+      make_continuation(env, betree_res, acc, event, unfetched, mode);
+
+  // Set up report
+  if (allocated_size < betree_res->sub_count) {
+    if (subs != NULL) enif_free(subs);
+    if (rets != NULL) { enif_free(rets); rets = NULL; }
+    subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    allocated_size = betree_res->sub_count;
+  }
+  subs_count = 0;
+
+  struct report report_s = {0};
+  struct report *report = &report_s;
+
+  struct group_stats_context gctx;
+  if (mode == SEARCH_STATS && acc != NULL) {
+    gctx = (struct group_stats_context){
+      .sub_index = betree_res->sub_index,
+      .group_count = betree_res->group_count,
+      .group_results = acc->group_results,
+      .attr_domain_count = acc->attr_domain_count,
+      .env = env,
+      .group_ids = betree_res->group_ids,
+      .attr_domains = betree_res->betree->config->attr_domains
+    };
+    report->cb = &update_group_stats;
+    report->cba = &bulk_update_group_stats;
+    report->arg = &gctx;
+  } else {
+    report->cb = &update_stats;
+    report->cba = &bulk_update_stats;
+    report->arg = betree_res;
+  }
+  report->config = betree_res->betree->config;
+
+  size_t pred_count = betree_res->betree->config->pred_map->memoize_count;
+  if (report->cb != NULL && pred_count > 0) {
+    report->memoize_vars = enif_alloc(pred_count * sizeof(*report->memoize_vars));
+  }
+
+  enum flat_search_result res = flat_search(&betree_res->betree->flat,
+                                            &cont->state, report);
+
+  if (report->memoize_vars != NULL) {
+    enif_free(report->memoize_vars);
+  }
+
+  if (res == FLAT_SEARCH_DONE) {
+    ERL_NIF_TERM result = make_final_result(env, cont);
+    enif_release_resource(cont);
+    return result;
+  }
+
+  // YIELD - save partial results
+  save_partial_subs(cont);
+  ERL_NIF_TERM retval = make_continuation_term(env, cont);
+  enif_release_resource(cont);
+  return retval;
+}
+
+static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
+                                               const ERL_NIF_TERM argv[]) {
+  if (argc != 2) {
+    return enif_make_badarg(env);
+  }
+
+  struct continuation_resource *cont = get_continuation(env, argv[0]);
+  if (cont == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  struct betree_resource *betree_res = cont->betree_res;
+  struct betree *betree = betree_res->betree;
+
+  // Parse [{VarIdx, Value}] updates
+  unsigned int update_len;
+  if (!enif_get_list_length(env, argv[1], &update_len)) {
+    return enif_make_badarg(env);
+  }
+
+  ERL_NIF_TERM head, tail = argv[1];
+  for (unsigned int i = 0; i < update_len; i++) {
+    if (!enif_get_list_cell(env, tail, &head, &tail)) {
+      return enif_make_badarg(env);
+    }
+    const ERL_NIF_TERM *pair;
+    int pair_len;
+    if (!enif_get_tuple(env, head, &pair_len, &pair) || pair_len != 2) {
+      return enif_make_badarg(env);
+    }
+    unsigned long var_idx;
+    if (!enif_get_uint64(env, pair[0], &var_idx)) {
+      return enif_make_badarg(env);
+    }
+    if (var_idx >= betree->config->attr_domain_count) {
+      return enif_make_badarg(env);
+    }
+
+    struct betree_variable_definition def =
+        betree_get_variable_definition(betree, var_idx);
+    struct betree_variable *variable = NULL;
+    bool result;
+    switch (def.type) {
+    case BETREE_BOOLEAN:
+      result = get_boolean(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_INTEGER:
+      result = get_int(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_FLOAT:
+      result = get_float(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_STRING:
+      result = get_binary(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_INTEGER_LIST:
+      result = get_int_list(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_STRING_LIST:
+      result = get_bin_list(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_SEGMENTS:
+      result = get_segments_list(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_FREQUENCY_CAPS:
+      result = get_frequency_caps_list(env, pair[1], def.name, &variable);
+      break;
+    case BETREE_INTEGER_ENUM:
+      result = get_int(env, pair[1], def.name, &variable);
+      break;
+    default:
+      result = false;
+      break;
+    }
+    if (!result) {
+      if (variable != NULL) betree_free_variable(variable);
+      return enif_make_badarg(env);
+    }
+    betree_set_variable(cont->event, var_idx, variable);
+    clear_bit(cont->state.unfetched, var_idx);
+    clear_bit(cont->state.undefined, var_idx);
+    // Update preds array
+    ((struct betree_variable**)cont->state.preds)[var_idx] =
+        cont->event->variables[var_idx];
+  }
+
+  // Resume search
+  if (allocated_size < betree_res->sub_count) {
+    if (subs != NULL) enif_free(subs);
+    if (rets != NULL) { enif_free(rets); rets = NULL; }
+    subs = (ERL_NIF_TERM*)enif_alloc(betree_res->sub_count * sizeof(ERL_NIF_TERM));
+    allocated_size = betree_res->sub_count;
+  }
+  subs_count = 0;
+
+  struct report report_s = {0};
+  struct report *report = &report_s;
+
+  struct group_stats_context gctx;
+  if (cont->mode == SEARCH_STATS && cont->stats_res != NULL) {
+    gctx = (struct group_stats_context){
+      .sub_index = betree_res->sub_index,
+      .group_count = betree_res->group_count,
+      .group_results = cont->stats_res->group_results,
+      .attr_domain_count = cont->stats_res->attr_domain_count,
+      .env = env,
+      .group_ids = betree_res->group_ids,
+      .attr_domains = betree_res->betree->config->attr_domains
+    };
+    report->cb = &update_group_stats;
+    report->cba = &bulk_update_group_stats;
+    report->arg = &gctx;
+  } else if (cont->mode == SEARCH_STATS) {
+    report->cb = &update_stats;
+    report->cba = &bulk_update_stats;
+    report->arg = betree_res;
+  } else if (cont->mode == SEARCH_DEBUG) {
+    report->cb = &acc_ret;
+    report->cba = &acc_arr;
+    report->arg = betree_res;
+  }
+  report->config = betree_res->betree->config;
+
+  size_t pred_count = betree_res->betree->config->pred_map->memoize_count;
+  if (report->cb != NULL && pred_count > 0) {
+    report->memoize_vars = enif_alloc(pred_count * sizeof(*report->memoize_vars));
+  }
+
+  enum flat_search_result res = flat_search(&betree_res->betree->flat,
+                                            &cont->state, report);
+
+  if (report->memoize_vars != NULL) {
+    enif_free(report->memoize_vars);
+  }
+
+  if (res == FLAT_SEARCH_DONE) {
+    return make_final_result(env, cont);
+  }
+
+  // YIELD again
+  save_partial_subs(cont);
+  return make_continuation_term(env, cont);
+}
+
 // original function descriptors
 static ErlNifFunc nif_functions[] = {
     {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
@@ -2482,6 +3019,9 @@ static ErlNifFunc nif_functions[] = {
     {"betree_stats_start", 1, nif_betree_stats_start, 0},
     {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
+    {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
+    {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
+    {"betree_search_continue", 2, nif_betree_search_continue, 0},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -2508,6 +3048,9 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_stats_start", 1, nif_betree_stats_start, 0},
     {"betree_stats_stop", 2, nif_betree_stats_stop, 0},
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
+    {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
+    {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
+    {"betree_search_continue", 2, nif_betree_search_continue, 0},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants

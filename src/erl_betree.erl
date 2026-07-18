@@ -28,7 +28,11 @@
     betree_stats_start/1,
     betree_stats_stop/1,
     betree_stats_stop_return/1,
-    betree_group_vars/1
+    betree_group_vars/1,
+
+    betree_prepare_flat/1,
+    betree_search_lazy/2,
+    betree_search_continue/2
 ]).
 
 
@@ -103,3 +107,12 @@ betree_stats_stop_return(StatsAccumulator) ->
 
 betree_group_vars(Betree) ->
     erl_betree_nif:betree_group_vars(Betree).
+
+betree_prepare_flat(Betree) ->
+    erl_betree_nif:betree_prepare_flat(Betree).
+
+betree_search_lazy(BetreeOrAcc, Event) ->
+    erl_betree_nif:betree_search_lazy(BetreeOrAcc, Event).
+
+betree_search_continue(Continuation, Updates) ->
+    erl_betree_nif:betree_search_continue(Continuation, Updates).
