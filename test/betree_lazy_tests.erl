@@ -46,11 +46,12 @@ basic_lazy_test() ->
     %% Lazy: b is unfetched
     EventLazy = [#ev{a = 1, b = unfetched, c = 3}],
     case erl_betree:betree_search_lazy(Betree, EventLazy) of
-        {continue, Cont, NeededVars} ->
-            ?assert(lists:member(1, NeededVars)),
+        {continue, Cont, PartialMatched} ->
+            ?assert(is_list(PartialMatched)),
             %% Provide the missing var: b (index 1) = 2
             {ok, Matched2} = erl_betree:betree_search_continue(Cont, [{1, 2}]),
-            ?assertEqual(lists:sort(Matched2), [1, 2, 3]);
+            AllMatched = lists:sort(PartialMatched ++ Matched2),
+            ?assertEqual(AllMatched, [1, 2, 3]);
         {ok, _} ->
             %% Should not complete without b
             ?assert(false)
@@ -85,24 +86,17 @@ lazy_multiple_yields_test() ->
     EventLazy = [#ev{a = 1, b = unfetched, c = unfetched}],
     Result = erl_betree:betree_search_lazy(Betree, EventLazy),
     ?assertMatch({continue, _, _}, Result),
-    {continue, Cont1, Needed1} = Result,
+    {continue, Cont1, Matched1} = Result,
 
-    %% Provide only the first needed var
-    [FirstNeeded | _] = Needed1,
-    Val = case FirstNeeded of
-        1 -> 2; % b = 2
-        2 -> 3  % c = 3
-    end,
-    Result2 = erl_betree:betree_search_continue(Cont1, [{FirstNeeded, Val}]),
+    %% Provide b = 2
+    Result2 = erl_betree:betree_search_continue(Cont1, [{1, 2}]),
     case Result2 of
-        {ok, Matched} ->
-            ?assert(length(Matched) > 0);
-        {continue, Cont2, Needed2} ->
-            [SecondNeeded | _] = Needed2,
-            Val2 = case SecondNeeded of
-                1 -> 2;
-                2 -> 3
-            end,
-            {ok, Matched2} = erl_betree:betree_search_continue(Cont2, [{SecondNeeded, Val2}]),
-            ?assertEqual(lists:sort(Matched2), [1, 2])
+        {ok, Matched2} ->
+            AllMatched = lists:sort(Matched1 ++ Matched2),
+            ?assertEqual([1, 2], AllMatched);
+        {continue, Cont2, Matched2} ->
+            %% Provide c = 3
+            {ok, Matched3} = erl_betree:betree_search_continue(Cont2, [{2, 3}]),
+            AllMatched = lists:sort(Matched1 ++ Matched2 ++ Matched3),
+            ?assertEqual([1, 2], AllMatched)
     end.
