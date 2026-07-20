@@ -780,118 +780,70 @@ static bool add_domains(ErlNifEnv *env, struct betree *betree,
   return true;
 }
 
-static bool add_variables(ErlNifEnv *env, struct betree *betree,
-                          struct betree_event *event, const ERL_NIF_TERM *tuple,
-                          int tuple_len, size_t initial_domain_index) {
-  // Start at 1 to not use the record name
-  for (int i = 1; i < tuple_len; i++) {
-    ERL_NIF_TERM element = tuple[i];
-    if (enif_is_identical(atom_undefined, element)) {
-      continue;
-    }
-    size_t domain_index = initial_domain_index + i - 1;
-    struct betree_variable_definition def =
-        betree_get_variable_definition(betree, domain_index);
-    bool result;
-    struct betree_variable *variable = NULL;
-    switch (def.type) {
-    case BETREE_BOOLEAN:
-      result = get_boolean(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER:
-      result = get_int(env, element, def.name, &variable);
-      break;
-    case BETREE_FLOAT:
-      result = get_float(env, element, def.name, &variable);
-      break;
-    case BETREE_STRING:
-      result = get_binary(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER_LIST:
-      result = get_int_list(env, element, def.name, &variable);
-      break;
-    case BETREE_STRING_LIST:
-      result = get_bin_list(env, element, def.name, &variable);
-      break;
-    case BETREE_SEGMENTS:
-      result = get_segments_list(env, element, def.name, &variable);
-      break;
-    case BETREE_FREQUENCY_CAPS:
-      result = get_frequency_caps_list(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER_ENUM:
-      result = get_int(env, element, def.name, &variable);
-      break;
-    default:
-      result = false;
-      break;
-    }
-    if (result == false) {
-      if (variable != NULL) {
-        betree_free_variable(variable);
-      }
-      return false;
-    }
-    betree_set_variable(event, domain_index, variable);
+static bool parse_variable(ErlNifEnv *env, ERL_NIF_TERM term,
+                           const struct betree_variable_definition *def,
+                           struct betree_variable **out) {
+  *out = NULL;
+  bool result;
+  switch (def->type) {
+  case BETREE_BOOLEAN:
+    result = get_boolean(env, term, def->name, out);
+    break;
+  case BETREE_INTEGER:
+    result = get_int(env, term, def->name, out);
+    break;
+  case BETREE_FLOAT:
+    result = get_float(env, term, def->name, out);
+    break;
+  case BETREE_STRING:
+    result = get_binary(env, term, def->name, out);
+    break;
+  case BETREE_INTEGER_LIST:
+    result = get_int_list(env, term, def->name, out);
+    break;
+  case BETREE_STRING_LIST:
+    result = get_bin_list(env, term, def->name, out);
+    break;
+  case BETREE_SEGMENTS:
+    result = get_segments_list(env, term, def->name, out);
+    break;
+  case BETREE_FREQUENCY_CAPS:
+    result = get_frequency_caps_list(env, term, def->name, out);
+    break;
+  case BETREE_INTEGER_ENUM:
+    result = get_int(env, term, def->name, out);
+    break;
+  default:
+    result = false;
+    break;
   }
-  return true;
+  if (!result && *out != NULL) {
+    betree_free_variable(*out);
+    *out = NULL;
+  }
+  return result;
 }
 
-static bool add_variables_lazy(ErlNifEnv *env, struct betree *betree,
-                               struct betree_event *event, const ERL_NIF_TERM *tuple,
-                               int tuple_len, size_t initial_domain_index) {
+static bool add_variables(ErlNifEnv *env, struct betree *betree,
+                          struct betree_event *event, const ERL_NIF_TERM *tuple,
+                          int tuple_len, size_t initial_domain_index,
+                          bool lazy) {
   for (int i = 1; i < tuple_len; i++) {
     ERL_NIF_TERM element = tuple[i];
-    size_t domain_index = initial_domain_index + i - 1;
     if (enif_is_identical(atom_undefined, element)) {
       continue;
     }
+    size_t domain_index = initial_domain_index + i - 1;
     struct betree_variable_definition def =
         betree_get_variable_definition(betree, domain_index);
-    if (enif_is_identical(atom_unfetched, element)) {
+    if (lazy && enif_is_identical(atom_unfetched, element)) {
       struct betree_variable *variable =
           betree_make_unfetched_variable(def.name);
       betree_set_variable(event, domain_index, variable);
       continue;
     }
-    bool result;
-    struct betree_variable *variable = NULL;
-    switch (def.type) {
-    case BETREE_BOOLEAN:
-      result = get_boolean(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER:
-      result = get_int(env, element, def.name, &variable);
-      break;
-    case BETREE_FLOAT:
-      result = get_float(env, element, def.name, &variable);
-      break;
-    case BETREE_STRING:
-      result = get_binary(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER_LIST:
-      result = get_int_list(env, element, def.name, &variable);
-      break;
-    case BETREE_STRING_LIST:
-      result = get_bin_list(env, element, def.name, &variable);
-      break;
-    case BETREE_SEGMENTS:
-      result = get_segments_list(env, element, def.name, &variable);
-      break;
-    case BETREE_FREQUENCY_CAPS:
-      result = get_frequency_caps_list(env, element, def.name, &variable);
-      break;
-    case BETREE_INTEGER_ENUM:
-      result = get_int(env, element, def.name, &variable);
-      break;
-    default:
-      result = false;
-      break;
-    }
-    if (result == false) {
-      if (variable != NULL) {
-        betree_free_variable(variable);
-      }
+    struct betree_variable *variable;
+    if (!parse_variable(env, element, &def, &variable)) {
       return false;
     }
     betree_set_variable(event, domain_index, variable);
@@ -1056,7 +1008,7 @@ static ERL_NIF_TERM nif_betree_make_event(ErlNifEnv *env, int argc,
       goto cleanup;
     }
 
-    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index, false)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1500,7 +1452,7 @@ static ERL_NIF_TERM nif_betree_search(ErlNifEnv *env, int argc,
       goto cleanup;
     }
 
-    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index, false)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1702,7 +1654,7 @@ static ERL_NIF_TERM nif_betree_search_debug(ErlNifEnv *env, int argc, const ERL_
       goto cleanup;
     }
 
-    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index, false)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1798,7 +1750,7 @@ static ERL_NIF_TERM nif_betree_search_stats(ErlNifEnv *env, int argc, const ERL_
       goto cleanup;
     }
 
-    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index, false)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -1997,7 +1949,7 @@ static ERL_NIF_TERM nif_betree_exists(ErlNifEnv *env, int argc,
       goto cleanup;
     }
 
-    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index)) {
+    if (!add_variables(env, betree, event, tuple, tuple_len, pred_index, false)) {
       retval = enif_make_badarg(env);
       goto cleanup;
     }
@@ -2586,8 +2538,8 @@ static bool parse_event_lazy(ErlNifEnv *env, struct betree_resource *betree_res,
     const ERL_NIF_TERM *tuple;
     int tuple_len;
     if (!enif_get_tuple(env, head, &tuple_len, &tuple)) goto fail;
-    if (!add_variables_lazy(env, betree, event, tuple, tuple_len,
-                            pred_index)) goto fail;
+    if (!add_variables(env, betree, event, tuple, tuple_len,
+                        pred_index, true)) goto fail;
     pred_index += (tuple_len - 1);
   }
 
@@ -2713,42 +2665,8 @@ static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
 
     struct betree_variable_definition def =
         betree_get_variable_definition(betree, var_idx);
-    struct betree_variable *variable = NULL;
-    bool result;
-    switch (def.type) {
-    case BETREE_BOOLEAN:
-      result = get_boolean(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_INTEGER:
-      result = get_int(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_FLOAT:
-      result = get_float(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_STRING:
-      result = get_binary(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_INTEGER_LIST:
-      result = get_int_list(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_STRING_LIST:
-      result = get_bin_list(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_SEGMENTS:
-      result = get_segments_list(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_FREQUENCY_CAPS:
-      result = get_frequency_caps_list(env, pair[1], def.name, &variable);
-      break;
-    case BETREE_INTEGER_ENUM:
-      result = get_int(env, pair[1], def.name, &variable);
-      break;
-    default:
-      result = false;
-      break;
-    }
-    if (!result) {
-      if (variable != NULL) betree_free_variable(variable);
+    struct betree_variable *variable;
+    if (!parse_variable(env, pair[1], &def, &variable)) {
       return enif_make_badarg(env);
     }
     betree_set_variable(cont->event, var_idx, variable);
