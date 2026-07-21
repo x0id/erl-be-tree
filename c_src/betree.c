@@ -1151,6 +1151,7 @@ cleanup:
 }
 
 static bool prepare_subs_data(struct betree_resource* betree_res) {
+  if (betree_res->betree->subs_data != NULL) return true;
   betree_res->betree->subs_data = (struct subs_data*)enif_alloc(sizeof(struct subs_data));
   if (betree_res->betree->subs_data == NULL) {
     goto cleanup;
@@ -1538,13 +1539,13 @@ static void bulk_update_stats(void* arg, void** data, size_t count, const void* 
 
 // Group-based stats accumulation structure
 struct group_stats_context {
-  struct sub_info* sub_index;           // Direct pointer to subscription index
-  size_t group_count;            // Number of groups
-  betree_var_t* group_results;          // Per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
-  size_t attr_domain_count;             // Number of attribute domains
+  struct sub_info* sub_index;         // Direct pointer to subscription index
+  size_t group_count;                 // Number of groups
+  betree_var_t* group_results;        // Per-group results: 0=no value, 1=passed, (var_idx+2)=failure reason
+  size_t attr_domain_count;           // Number of attribute domains
   ErlNifEnv* env;
-  ERL_NIF_TERM* group_ids;             // group_id terms for trace lookup
-  struct attr_domain** attr_domains;   // for var name lookup
+  ERL_NIF_TERM* group_ids;            // group_id terms for trace lookup
+  struct attr_domain** attr_domains;  // for var name lookup
 };
 
 static void update_group_stats(void *arg, void *data, bool success, const void *context) {

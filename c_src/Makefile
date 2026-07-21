@@ -31,7 +31,7 @@ CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR) -I $(BETR
 LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lei -L $(BETREE_LIB_DIR) -lbetree
 
 ifeq ($(UNAME), Darwin)
-	LDFLAGS += -bundle -flat_namespace -undefined suppress
+	LDFLAGS += -bundle -undefined dynamic_lookup
 else
 	LDFLAGS += -shared
 endif
@@ -49,7 +49,9 @@ OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
 
 COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) -c
 
-$(C_SRC_OUTPUT): $(OBJECTS)
+BETREE_LIB = ../be-tree/build/libbetree.a
+
+$(C_SRC_OUTPUT): $(OBJECTS) $(BETREE_LIB)
 	@mkdir -p $(BASEDIR)/priv/
 	$(link_verbose) $(CC) $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT)
 
