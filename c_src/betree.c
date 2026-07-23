@@ -106,7 +106,6 @@ struct stats_resource {
 
 struct continuation_resource {
   struct betree_resource *betree_res;
-  struct stats_resource *stats_res;
   struct betree_event *event;
   struct flat_search_state *state;
 };
@@ -198,9 +197,6 @@ static void cleanup_continuation(ErlNifEnv *env, void *obj) {
   }
   if (cont->state != NULL) {
     flat_search_state_free(cont->state);
-  }
-  if (cont->stats_res != NULL) {
-    enif_release_resource(cont->stats_res);
   }
   if (cont->betree_res != NULL) {
     enif_release_resource(cont->betree_res);
@@ -2554,7 +2550,6 @@ fail:
 
 static struct continuation_resource *make_continuation(
     ErlNifEnv *env, struct betree_resource *betree_res,
-    struct stats_resource *stats_res,
     struct betree_event *event) {
   struct continuation_resource *cont =
       enif_alloc_resource(MEM_CONTINUATION, sizeof(*cont));
@@ -2562,10 +2557,6 @@ static struct continuation_resource *make_continuation(
 
   cont->betree_res = betree_res;
   enif_keep_resource(betree_res);
-  cont->stats_res = stats_res;
-  if (stats_res != NULL) {
-    enif_keep_resource(stats_res);
-  }
   cont->event = event;
 
   return cont;
@@ -2619,7 +2610,7 @@ static ERL_NIF_TERM nif_betree_search_lazy(ErlNifEnv *env, int argc,
 
   // YIELD - create continuation
   struct continuation_resource *cont =
-      make_continuation(env, betree_res, acc, event);
+      make_continuation(env, betree_res, event);
   cont->state = report->state;
   ERL_NIF_TERM retval = make_yield_result(env, cont);
   enif_release_resource(cont);
@@ -2628,25 +2619,43 @@ static ERL_NIF_TERM nif_betree_search_lazy(ErlNifEnv *env, int argc,
 
 static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
                                                const ERL_NIF_TERM argv[]) {
-  if (argc != 2) {
+  if (argc != 3) {
     return enif_make_badarg(env);
   }
 
-  struct continuation_resource *cont = get_continuation(env, argv[0]);
+  // argv[0]: BetreeOrAcc - provides stats context and betree identity check
+  struct stats_resource *acc = get_stats_accumulator(env, argv[0]);
+  struct betree_resource *caller_betree_res = NULL;
+
+  if (acc != NULL) {
+    if (!acc->active) return enif_make_badarg(env);
+    caller_betree_res = acc->betree_res;
+  } else {
+    caller_betree_res = get_betree_resource(env, argv[0]);
+    if (caller_betree_res == NULL) return enif_make_badarg(env);
+  }
+
+  // argv[1]: Continuation
+  struct continuation_resource *cont = get_continuation(env, argv[1]);
   if (cont == NULL) {
+    return enif_make_badarg(env);
+  }
+
+  // Verify that both refer to the same betree
+  if (caller_betree_res != cont->betree_res) {
     return enif_make_badarg(env);
   }
 
   struct betree_resource *betree_res = cont->betree_res;
   struct betree *betree = betree_res->betree;
 
-  // Parse [{VarIdx, Value}] updates into cont->event
+  // argv[2]: [{VarIdx, Value}] updates into cont->event
   unsigned int update_len;
-  if (!enif_get_list_length(env, argv[1], &update_len)) {
+  if (!enif_get_list_length(env, argv[2], &update_len)) {
     return enif_make_badarg(env);
   }
 
-  ERL_NIF_TERM head, tail = argv[1];
+  ERL_NIF_TERM head, tail = argv[2];
   for (unsigned int i = 0; i < update_len; i++) {
     if (!enif_get_list_cell(env, tail, &head, &tail)) {
       return enif_make_badarg(env);
@@ -2682,7 +2691,7 @@ static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
   struct report report_s = {0};
   struct report *report = &report_s;
   struct group_stats_context gctx;
-  setup_report(report, env, betree_res, cont->stats_res, &gctx);
+  setup_report(report, env, betree_res, acc, &gctx);
   report->state = cont->state;
 
   enum flat_search_result res = betree_search_flat(betree, cont->event, report);
@@ -2724,7 +2733,7 @@ static ErlNifFunc nif_functions[] = {
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
     {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
     {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
-    {"betree_search_continue", 2, nif_betree_search_continue, 0},
+    {"betree_search_continue", 3, nif_betree_search_continue, 0},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -2753,7 +2762,7 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
     {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
     {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
-    {"betree_search_continue", 2, nif_betree_search_continue, 0},
+    {"betree_search_continue", 3, nif_betree_search_continue, 0},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants

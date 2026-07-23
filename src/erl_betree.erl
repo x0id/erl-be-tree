@@ -32,7 +32,7 @@
 
     betree_prepare_flat/1,
     betree_search_lazy/2,
-    betree_search_continue/2
+    betree_search_continue/3
 ]).
 
 
@@ -114,5 +114,5 @@ betree_prepare_flat(Betree) ->
 betree_search_lazy(BetreeOrAcc, Event) ->
     erl_betree_nif:betree_search_lazy(BetreeOrAcc, Event).
 
-betree_search_continue(Continuation, Updates) ->
-    erl_betree_nif:betree_search_continue(Continuation, Updates).
+betree_search_continue(BetreeOrAcc, Continuation, Updates) ->
+    erl_betree_nif:betree_search_continue(BetreeOrAcc, Continuation, Updates).
