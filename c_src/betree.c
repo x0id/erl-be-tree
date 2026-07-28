@@ -2673,6 +2673,16 @@ static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
       return enif_make_badarg(env);
     }
 
+    // Only update variables that are in unfetched state
+    struct betree_variable *old = cont->event->variables[var_idx];
+    if (old == NULL || old->value.value_type != BETREE_UNFETCHED) {
+      continue;
+    }
+    betree_free_variable(old);
+    if (enif_is_identical(atom_undefined, pair[1])) {
+      cont->event->variables[var_idx] = NULL;
+      continue;
+    }
     struct betree_variable_definition def =
         betree_get_variable_definition(betree, var_idx);
     struct betree_variable *variable;
