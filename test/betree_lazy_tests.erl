@@ -142,3 +142,81 @@ continue_stats_mismatch_test() ->
     {ok, AccRef} = erl_betree:betree_stats_start(Betree2),
     ?assertError(badarg, erl_betree:betree_search_continue(AccRef, Cont, [{1, 2}])),
     erl_betree:betree_stats_stop(AccRef).
+
+continue_undefined_resolves_unfetched_test() ->
+    Domains = [[
+        {a, int, disallow_undefined},
+        {b, int, allow_undefined}
+    ]],
+    {ok, Betree} = erl_betree:betree_make(Domains),
+    ok = erl_betree:betree_add_sub(Betree, 1, [], <<"a = 1">>),
+    ok = erl_betree:betree_add_sub(Betree, 2, [], <<"a = 1 and b = 2">>),
+    ok = erl_betree:betree_prepare_flat(Betree),
+
+    %% b is unfetched, should yield
+    EventLazy = [{ev, 1, unfetched}],
+    {continue, Cont, Partial} = erl_betree:betree_search_lazy(Betree, EventLazy),
+
+    %% Resolve b as undefined (service returned no data)
+    {ok, Matched} = erl_betree:betree_search_continue(Betree, Cont, [{1, undefined}]),
+    AllMatched = lists:sort(Partial ++ Matched),
+    %% Sub 1 matches (a=1, no b dependency), sub 2 does not (b is undefined, not 2)
+    ?assertEqual([1], AllMatched).
+
+continue_undefined_disallow_undefined_test() ->
+    Domains = [[
+        {a, int, disallow_undefined},
+        {b, int, disallow_undefined}
+    ]],
+    {ok, Betree} = erl_betree:betree_make(Domains),
+    ok = erl_betree:betree_add_sub(Betree, 1, [], <<"a = 1">>),
+    ok = erl_betree:betree_add_sub(Betree, 2, [], <<"b = 2">>),
+    ok = erl_betree:betree_prepare_flat(Betree),
+
+    %% b is unfetched
+    EventLazy = [{ev, 1, unfetched}],
+    {continue, Cont, Partial} = erl_betree:betree_search_lazy(Betree, EventLazy),
+
+    %% Resolve b as undefined — sub 2 requires b (disallow_undefined), won't match
+    {ok, Matched} = erl_betree:betree_search_continue(Betree, Cont, [{1, undefined}]),
+    AllMatched = lists:sort(Partial ++ Matched),
+    ?assertEqual([1], AllMatched).
+
+continue_undefined_skips_non_unfetched_test() ->
+    Domains = [[
+        {a, int, disallow_undefined},
+        {b, int, disallow_undefined}
+    ]],
+    {ok, Betree} = erl_betree:betree_make(Domains),
+    ok = erl_betree:betree_add_sub(Betree, 1, [], <<"a = 1 and b = 2">>),
+    ok = erl_betree:betree_prepare_flat(Betree),
+
+    %% Only b is unfetched, a has a real value
+    EventLazy = [{ev, 1, unfetched}],
+    {continue, Cont, _Partial} = erl_betree:betree_search_lazy(Betree, EventLazy),
+
+    %% Send updates for both a and b — a should be ignored (not unfetched)
+    {ok, Matched} = erl_betree:betree_search_continue(Betree, Cont, [{0, 99}, {1, 2}]),
+    %% Sub 1 matches because a=1 (original) and b=2, not a=99
+    ?assertEqual([1], Matched).
+
+continue_split_stats_test() ->
+    Domains = [[
+        {a, int, disallow_undefined},
+        {b, int, disallow_undefined}
+    ]],
+    {ok, Betree} = erl_betree:betree_make(Domains),
+    ok = erl_betree:betree_add_sub(Betree, 1, g1, [], <<"a = 1 and b = 2">>),
+    ok = erl_betree:betree_prepare_flat(Betree),
+
+    %% Phase 1: search_lazy under AccRef1
+    {ok, AccRef1} = erl_betree:betree_stats_start(Betree),
+    EventLazy = [{ev, 1, unfetched}],
+    {continue, Cont, _Partial} = erl_betree:betree_search_lazy(AccRef1, EventLazy),
+    erl_betree:betree_stats_stop(AccRef1),
+
+    %% Phase 2: search_continue under AccRef2 (different stats accumulator)
+    {ok, AccRef2} = erl_betree:betree_stats_start(Betree),
+    {ok, Matched} = erl_betree:betree_search_continue(AccRef2, Cont, [{1, 2}]),
+    erl_betree:betree_stats_stop(AccRef2),
+    ?assertEqual([1], Matched).
