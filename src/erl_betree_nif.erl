@@ -30,7 +30,9 @@
 
     betree_prepare_flat/1,
     betree_search_lazy/2,
-    betree_search_continue/3
+    betree_search_lazy/3,
+    betree_search_continue/3,
+    betree_search_continue/4
 ]).
 
 -spec on_load() -> ok.
@@ -106,5 +108,9 @@ betree_prepare_flat(_Betree) ->
     ?nif_stub.
 betree_search_lazy(_BetreeOrAcc, _Event) ->
     ?nif_stub.
+betree_search_lazy(_BetreeOrAcc, _Event, _ClockType) ->
+    ?nif_stub.
 betree_search_continue(_BetreeOrAcc, _Continuation, _Updates) ->
+    ?nif_stub.
+betree_search_continue(_BetreeOrAcc, _Continuation, _Updates, _ClockType) ->
     ?nif_stub.

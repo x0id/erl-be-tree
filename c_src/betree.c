@@ -2717,6 +2717,36 @@ static ERL_NIF_TERM nif_betree_search_continue(ErlNifEnv *env, int argc,
   return make_yield_result(env, cont);
 }
 
+static ERL_NIF_TERM nif_betree_search_lazy_t(ErlNifEnv *env, int argc,
+                                             const ERL_NIF_TERM argv[]) {
+  if (argc != 3) return enif_make_badarg(env);
+  int clock_type = 0;
+  if (!enif_get_int(env, argv[2], &clock_type)) return enif_make_badarg(env);
+  clock_type = reverse_get_clock_type(clock_type);
+  struct timespec start, done;
+  clock_gettime(clock_type, &start);
+  ERL_NIF_TERM search_res = nif_betree_search_lazy(env, argc - 1, argv);
+  if (!enif_is_tuple(env, search_res)) return search_res;
+  clock_gettime(clock_type, &done);
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  return enif_make_tuple2(env, search_res, etspent);
+}
+
+static ERL_NIF_TERM nif_betree_search_continue_t(ErlNifEnv *env, int argc,
+                                                 const ERL_NIF_TERM argv[]) {
+  if (argc != 4) return enif_make_badarg(env);
+  int clock_type = 0;
+  if (!enif_get_int(env, argv[3], &clock_type)) return enif_make_badarg(env);
+  clock_type = reverse_get_clock_type(clock_type);
+  struct timespec start, done;
+  clock_gettime(clock_type, &start);
+  ERL_NIF_TERM search_res = nif_betree_search_continue(env, argc - 1, argv);
+  if (!enif_is_tuple(env, search_res)) return search_res;
+  clock_gettime(clock_type, &done);
+  ERL_NIF_TERM etspent = make_time(env, &start, &done);
+  return enif_make_tuple2(env, search_res, etspent);
+}
+
 // original function descriptors
 static ErlNifFunc nif_functions[] = {
     {"betree_print", 1, nif_betree_print, ERL_DIRTY_JOB_IO_BOUND},
@@ -2743,7 +2773,9 @@ static ErlNifFunc nif_functions[] = {
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
     {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
     {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
+    {"betree_search_lazy", 3, nif_betree_search_lazy_t, 0},
     {"betree_search_continue", 3, nif_betree_search_continue, 0},
+    {"betree_search_continue", 4, nif_betree_search_continue_t, 0},
 };
 
 // alternative function descriptors with nif_betree_search_'s dirty flag
@@ -2772,7 +2804,9 @@ static ErlNifFunc nif_functions_[] = {
     {"betree_group_vars", 1, nif_betree_group_vars, 0},
     {"betree_prepare_flat", 1, nif_betree_prepare_flat, 0},
     {"betree_search_lazy", 2, nif_betree_search_lazy, 0},
+    {"betree_search_lazy", 3, nif_betree_search_lazy_t, 0},
     {"betree_search_continue", 3, nif_betree_search_continue, 0},
+    {"betree_search_continue", 4, nif_betree_search_continue_t, 0},
 };
 
 // ERL_NIF_INIT replacement for environment-controlled variants
