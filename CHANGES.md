@@ -1,3 +1,105 @@
+# v1.6.0 (2026-07-28)
+
+## Summary
+
+Adds **lazy variable evaluation**: events can mark a variable as `unfetched`,
+and the search yields a continuation instead of forcing the caller to
+materialize every variable up front. The caller resolves only the variables
+actually needed to decide the outcome, then resumes. Built on top of the
+be-tree submodule's flat-tree/tri-state search (bumped to `v1.6.0`).
+
+---
+
+## New Erlang API Functions
+
+| Function | Description |
+|----------|-------------|
+| `betree_prepare_flat/1` | Flattens the tree (must be called once, after all subs are inserted, before `betree_search_lazy/2,3`) |
+| `betree_search_lazy/2,3` | Search an event that may contain `unfetched` variables; returns `{ok, MatchedIds}` or `{continue, Continuation, PartialMatchedIds}`. The `/3` form also returns elapsed time, like `betree_search_stats_t`/`betree_search_t` |
+| `betree_search_continue/3,4` | Resume a `Continuation` with `[{VarIdx, Value \| undefined}]` updates; returns `{ok, MatchedIds}` or another `{continue, ...}`. The `/4` form also returns elapsed time |
+
+Both `betree_search_lazy` and `betree_search_continue` accept either a
+`Betree` reference or a stats accumulator (as returned by
+`betree_stats_start/1`) as their first argument, matching the existing
+`betree_search_stats` convention. The two calls do **not** need to share the
+same accumulator — stats context is supplied independently at each resume,
+while the continuation itself carries only a reference to the originating
+betree (verified against the caller's betree/accumulator on `continue`, to
+reject use across different trees).
+
+Marking an event variable `unfetched` (e.g. `{ev, 1, unfetched, 3}`) tells the
+search not to evaluate anything that depends on it until a real value (or
+`undefined`) is supplied via `betree_search_continue`. Thanks to tri-state
+short-circuit in the underlying flat search, many subs resolve without ever
+needing the unfetched variable (e.g. `false and unknown`), so `continue` is
+only required when at least one sub's outcome is genuinely undecided.
+
+---
+
+## NIF Layer (c_src/betree.c)
+
+- **Flat/lazy search functions**: `nif_betree_prepare_flat`,
+  `nif_betree_search_lazy`, `nif_betree_search_continue`, and timed `_t`
+  wrappers, backed by the be-tree submodule's `betree_flatten` /
+  `betree_search_flat` / `BETREE_UNFETCHED` API.
+- **`MEM_CONTINUATION` resource type**: holds the originating
+  `betree_resource`, the in-progress `betree_event`, and the opaque
+  `flat_search_state` between yields. Continuation creation is deferred until
+  a yield actually occurs, avoiding an allocation on the non-yielding path.
+- **`parse_variable()`**: type-switch logic extracted out of
+  `add_variables`/`add_variables_lazy` so it can be reused by
+  `nif_betree_search_continue` when applying per-variable updates.
+- **`betree_search_continue` update handling**: updates are only applied to
+  event slots still holding `BETREE_UNFETCHED` — updates for variables that
+  already have a real value, or that were never marked unfetched, are
+  silently ignored rather than raising `badarg`. Supplying `undefined`
+  clears the slot to `NULL` (not-set) rather than leaving the sentinel in
+  place, so the flat search does not yield on it again.
+- **Simplified yield/continue accounting**: removed
+  `make_needed_vars_list`, `save_partial_subs`, `make_final_result`, and the
+  `partial_subs`/`partial_count`/`partial_capacity` fields on
+  `continuation_resource`. Each `betree_search_lazy`/`betree_search_continue`
+  call now returns only the matches found in that call; the Erlang caller is
+  responsible for accumulating matches across yields (see the updated
+  `betree_lazy_tests.erl` for the pattern).
+
+---
+
+## Build
+
+- **macOS linker**: replaced the deprecated `-flat_namespace -undefined
+  suppress` with `-undefined dynamic_lookup`.
+- **`libbetree.a` as a Makefile dependency**: the NIF `.so` is now relinked
+  automatically whenever `libbetree.a` changes, instead of requiring a clean
+  rebuild.
+- **`betree_prepare_subs`/`betree_prepare_flat` made idempotent**: calling
+  both (or either twice) no longer double-allocates the per-cdir subs-data
+  arrays.
+
+---
+
+## Tests
+
+- `betree_lazy_tests.erl`: new suite covering `betree_prepare_flat`,
+  single- and multi-yield lazy search, resuming with real values and with
+  `undefined`, `allow_undefined` vs `disallow_undefined` semantics for a
+  variable resolved to `undefined`, ignoring updates for non-unfetched
+  variables, mismatched-betree and mismatched-stats-accumulator `continue`
+  calls, and using separate stats accumulators for the lazy and continue
+  phases of the same search.
+
+---
+
+## Dependencies
+
+- **be-tree submodule bumped to `v1.6.0`**, which adds flat tree
+  serialization and continuation-based search, tri-state expression
+  evaluation (`match_node_tri`/`match_sub_tri`, `MATCH_UNKNOWN`), and the
+  `BETREE_PRED_UNFETCHED` sentinel-pointer representation for unfetched
+  variables (see be-tree's own `CHANGES.md` for details).
+
+---
+
 # v1.5.1 (2026-07-10)
 
 ## Removed
